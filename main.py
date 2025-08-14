@@ -566,24 +566,27 @@ def main():
         st.markdown('### Violations', unsafe_allow_html=True)
         viol_list = st.markdown('<div class="violation-box">No violations yet.</div>', unsafe_allow_html=True)
 
-    # WebRTC Streamer
-    class ExamProcessor(VideoProcessorBase):
-        def __init__(self) -> None:
-            self.detector = st.session_state.detector
+    # Only start WebRTC if detector is initialized
+    if 'detector' in st.session_state:
+        class ExamProcessor(VideoProcessorBase):
+            def __init__(self) -> None:
+                self.detector = st.session_state.detector
 
-        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-            img = frame.to_ndarray(format="bgr24")
-            processed = self.detector.process(img)
-            return av.VideoFrame.from_ndarray(processed, format="bgr24")
+            def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+                img = frame.to_ndarray(format="bgr24")
+                processed = self.detector.process(img)
+                return av.VideoFrame.from_ndarray(processed, format="bgr24")
 
-    ctx = webrtc_streamer(
-        key="exam-monitor",
-        mode=WebRtcMode.SENDRECV,
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-        media_stream_constraints={"video": True, "audio": False},
-        video_processor_factory=ExamProcessor,
-        async_processing=True,
-    )
+        ctx = webrtc_streamer(
+            key="exam-monitor",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+            media_stream_constraints={"video": True, "audio": False},
+            video_processor_factory=ExamProcessor,
+            async_processing=True,
+        )
+    else:
+        st.error("Detector not initialized. Please refresh the page.")
 
     # Handle button actions
     if save_btn:
@@ -612,7 +615,6 @@ def main():
     else:
         viol_text = '<div class="violation-box">No violations yet.</div>'
     viol_list.markdown(viol_text, unsafe_allow_html=True)
-
 
 if __name__ == '__main__':
     main()
