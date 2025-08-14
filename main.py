@@ -7,8 +7,6 @@ import os
 from datetime import datetime
 import pygame
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
-import av
 
 # Optional: ultralytics YOLO
 try:
@@ -21,17 +19,8 @@ except Exception:
 try:
     import mediapipe as mp
     MP_AVAILABLE = True
-except Exception as e:
-    print(f"MediaPipe not available: {e}")
+except Exception:
     MP_AVAILABLE = False
-
-# Fallback: OpenCV face detection
-try:
-    import cv2
-    CV2_AVAILABLE = True
-except Exception as e:
-    print(f"OpenCV not available: {e}")
-    CV2_AVAILABLE = False
 
 # Streamlit page config
 st.set_page_config(
@@ -141,27 +130,15 @@ st.markdown("""
 
 class ExamDetector:
     def __init__(self, use_yolo=YOLO_AVAILABLE, enable_sound=True):
-        if not MP_AVAILABLE and not CV2_AVAILABLE:
-            raise RuntimeError("Neither MediaPipe nor OpenCV is available. Install mediapipe or opencv-python package.")
-        
-        self.use_mediapipe = MP_AVAILABLE
-        self.use_opencv_fallback = not MP_AVAILABLE and CV2_AVAILABLE
+        if not MP_AVAILABLE:
+            raise RuntimeError("MediaPipe is required. Install mediapipe package.")
 
-        if self.use_mediapipe:
-            try:
-                self.mp_face_mesh = mp.solutions.face_mesh
-                self.face_mesh = self.mp_face_mesh.FaceMesh(static_image_mode=False,
-                                                            max_num_faces=1,
-                                                            refine_landmarks=True,
-                                                            min_detection_confidence=0.5,
-                                                            min_tracking_confidence=0.5)
-            except Exception as e:
-                raise RuntimeError(f"Failed to initialize MediaPipe: {e}")
-        elif self.use_opencv_fallback:
-            try:
-                self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-            except Exception as e:
-                raise RuntimeError(f"Failed to initialize OpenCV face detection: {e}")
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(static_image_mode=False,
+                                                    max_num_faces=1,
+                                                    refine_landmarks=True,
+                                                    min_detection_confidence=0.5,
+                                                    min_tracking_confidence=0.5)
 
         self.tracker = None
         self.tracking = False
@@ -202,14 +179,6 @@ class ExamDetector:
                 self.enable_sound = False
 
     def detect_face_mesh(self, frame):
-        if self.use_mediapipe:
-            return self._detect_face_mediapipe(frame)
-        elif self.use_opencv_fallback:
-            return self._detect_face_opencv(frame)
-        else:
-            return None, None, None
-    
-    def _detect_face_mediapipe(self, frame):
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(img_rgb)
         h, w = frame.shape[:2]
@@ -246,27 +215,6 @@ class ExamDetector:
             deviation = abs(eye_x - face_center_x)
             looking_forward = deviation < (bbox[2] * 0.25)
 
-        return bbox, (left_center, right_center), looking_forward
-    
-    def _detect_face_opencv(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self.face_cascade.detectMultiScale(gray, 1.1, 4)
-        
-        if len(faces) == 0:
-            return None, None, None
-        
-        # Use the largest face
-        largest_face = max(faces, key=lambda x: x[2] * x[3])
-        x, y, w, h = largest_face
-        bbox = (x, y, w, h)
-        
-        # Simple eye center estimation for OpenCV fallback
-        left_center = (x + w//4, y + h//3)
-        right_center = (x + 3*w//4, y + h//3)
-        
-        # Always assume looking forward for OpenCV fallback
-        looking_forward = True
-        
         return bbox, (left_center, right_center), looking_forward
 
     def detect_objects_yolo(self, frame):
@@ -602,41 +550,60 @@ class ExamDetector:
             y += 24
 
 
-class VideoTransformer(VideoTransformerBase):
-    def __init__(self):
-        self.detector = None
-        self.use_yolo = True
-        self.enable_sound = False  # Disable sound for web version
-        
-    def set_detector(self, detector):
-        self.detector = detector
-        
-    def transform(self, frame):
+class CameraThread:
+    def __init__(self, src=0, max_q=4):
+        self.cap = cv2.VideoCapture(0)
+        self.q = queue.Queue(maxsize=max_q)
+        self.stopped = False
+        t = threading.Thread(target=self.update, daemon=True)
+        t.start()
+
+    def update(self):
+        while not self.stopped:
+            if not self.cap.isOpened():
+                time.sleep(0.1)
+                continue
+            ret, frame = self.cap.read()
+            if not ret:
+                time.sleep(0.01)
+                continue
+            if self.q.full():
+                try:
+                    self.q.get_nowait()
+                except Exception:
+                    pass
+            self.q.put(frame)
+
+    def read(self):
         try:
-            img = frame.to_ndarray(format="bgr24")
-            
-            if self.detector is None:
-                # Add a simple overlay when no detector is active
-                h, w = img.shape[:2]
-                overlay = img.copy()
-                cv2.rectangle(overlay, (10, 10), (300, 80), (0, 0, 0), -1)
-                cv2.addWeighted(overlay, 0.7, img, 0.3, 0, img)
-                cv2.putText(img, 'Camera Active - Click Start to Monitor', (20, 35), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                cv2.putText(img, 'Waiting for AI models...', (20, 60), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-                return img
-                
-            processed = self.detector.process(img)
-            return processed
-        except Exception as e:
-            # Return original frame if processing fails
-            return frame.to_ndarray(format="bgr24")
+            return self.q.get(timeout=1)
+        except Exception:
+            return None
+
+    def release(self):
+        self.stopped = True
+        if self.cap.isOpened():
+            self.cap.release()
 
 
 def main():
     st.markdown('<div class="title">🎓 Exam Monitor</div>', unsafe_allow_html=True)
     st.markdown('<div class="subtitle">AI-powered exam proctoring with face tracking and object detection</div>', unsafe_allow_html=True)
+
+    col1, col2 = st.columns([3, 1], gap="large")
+
+    with col1:
+        stframe = st.empty()
+
+    with col2:
+        st.markdown('### Control Panel', unsafe_allow_html=True)
+        start = st.button('🟢 Start Monitoring', key='start', help="Start camera and monitoring", type="primary")
+        stop = st.button('🔴 Stop Monitoring', key='stop', help="Stop camera and monitoring")
+        save = st.button('💾 Save Report', key='save', help="Save violation report")
+        reset = st.button('🔄 Reset Violations', key='reset', help="Clear all violations")
+        st.markdown('---')
+        st.markdown('### Violations', unsafe_allow_html=True)
+        viol_list = st.markdown('<div class="violation-box">No violations yet.</div>', unsafe_allow_html=True)
 
     # Sidebar: Detection Info
     st.sidebar.header("Detection Info", divider="gray")
@@ -652,118 +619,56 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.header("Settings", divider="gray")
     use_yolo_checkbox = st.sidebar.checkbox('✅ Use YOLO Detection', value=True, help="Enable YOLO for object detection")
-    enable_sound = st.sidebar.checkbox('🔊 Enable Sound Alerts', value=False, help="Play alert sounds on violations (disabled in web version)")
-    
-    # Show detection method status
-    st.sidebar.markdown("---")
-    st.sidebar.header("Status", divider="gray")
-    if st.session_state.detector:
-        if st.session_state.detector.use_mediapipe:
-            st.sidebar.success("🎯 Using MediaPipe")
-        elif st.session_state.detector.use_opencv_fallback:
-            st.sidebar.warning("🎯 Using OpenCV Fallback")
-        else:
-            st.sidebar.info("🎯 Detection method unknown")
-    else:
-        st.sidebar.info("⏸️ Monitoring not started")
+    enable_sound = st.sidebar.checkbox('🔊 Enable Sound Alerts', value=True, help="Play alert sounds on violations")
 
-    # Initialize session state
-    if not hasattr(st.session_state, 'detector'):
+    if 'monitoring' not in st.session_state:
+        st.session_state.monitoring = False
         st.session_state.detector = None
-    if not hasattr(st.session_state, 'violations'):
-        st.session_state.violations = []
-    if not hasattr(st.session_state, 'total_violations'):
-        st.session_state.total_violations = 0
+        st.session_state.cam = None
 
-    # Control buttons
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        start = st.button('🟢 Start Monitoring', key='start', help="Start camera and monitoring", type="primary")
-    
-    with col2:
-        stop = st.button('🔴 Stop Monitoring', key='stop', help="Stop camera and monitoring")
-    
-    with col3:
-        save = st.button('💾 Save Report', key='save', help="Save violation report")
-    
-    with col4:
-        reset = st.button('🔄 Reset Violations', key='reset', help="Clear all violations")
+    if start and not st.session_state.monitoring:
+        st.session_state.cam = CameraThread()
+        st.session_state.detector = ExamDetector(use_yolo=use_yolo_checkbox and YOLO_AVAILABLE, enable_sound=enable_sound)
+        st.session_state.monitoring = True
+        st.success('✅ Monitoring started successfully')
 
-    # Create detector if starting
-    if start:
-        try:
-            with st.spinner('Initializing AI models... This may take a moment.'):
-                detector = ExamDetector(use_yolo=use_yolo_checkbox and YOLO_AVAILABLE, enable_sound=False)
-                st.session_state.detector = detector
-                
-                # Show which detection method is being used
-                if detector.use_mediapipe:
-                    st.success('✅ Monitoring started successfully (MediaPipe)')
-                elif detector.use_opencv_fallback:
-                    st.success('✅ Monitoring started successfully (OpenCV Fallback)')
-                else:
-                    st.success('✅ Monitoring started successfully')
-                    
-        except Exception as e:
-            st.error(f'❌ Failed to start monitoring: {str(e)}')
-            st.info('💡 Try refreshing the page and starting again.')
-
-    # Stop monitoring
-    if stop:
-        st.session_state.detector = None
+    if stop and st.session_state.monitoring:
+        if st.session_state.cam is not None:
+            st.session_state.cam.release()
+        st.session_state.monitoring = False
         st.success('⏹️ Monitoring stopped')
 
-    # Save report
-    if save and st.session_state.detector:
-        save_report(st.session_state.detector)
-        st.success('✅ Report saved successfully')
+    try:
+        while st.session_state.monitoring:
+            frame = st.session_state.cam.read()
+            if frame is None:
+                continue
+            out = st.session_state.detector.process(frame)
+            stframe.image(out, channels='BGR', caption="Live Video Stream", use_container_width=True)
 
-    # Reset violations
-    if reset and st.session_state.detector:
-        st.session_state.detector.violations = []
-        st.session_state.detector.total_violations = 0
-        st.success('🔄 Violations reset')
+            if st.session_state.detector.violations:
+                viol_text = '<div class="violation-box">' + ''.join([
+                    f'<p><strong>#{len(st.session_state.detector.violations)-i}</strong> {v["type"].title()} at {v["time"]}</p>'
+                    for i, v in enumerate(reversed(st.session_state.detector.violations))
+                ]) + '</div>'
+            else:
+                viol_text = '<div class="violation-box">No violations yet.</div>'
+            viol_list.markdown(viol_text, unsafe_allow_html=True)
 
-    # WebRTC configuration
-    rtc_configuration = RTCConfiguration({
-        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-    })
+            if save:
+                save_report(st.session_state.detector)
+                st.success('✅ Report saved successfully')
 
-    # WebRTC streamer with proper factory function
-    def create_video_transformer():
-        transformer = VideoTransformer()
-        try:
-            if hasattr(st.session_state, 'detector') and st.session_state.detector is not None:
-                transformer.set_detector(st.session_state.detector)
-        except Exception as e:
-            print(f"Error setting detector: {e}")
-        return transformer
+            if reset:
+                st.session_state.detector.violations = []
+                st.session_state.detector.total_violations = 0
+                st.success('🔄 Violations reset')
 
-    webrtc_ctx = webrtc_streamer(
-        key="exam-monitor",
-        video_transformer_factory=create_video_transformer,
-        rtc_configuration=rtc_configuration,
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=True,
-    )
+    except Exception as e:
+        st.error(f'🚨 Error in monitoring loop: {e}')
 
-    # Display violations
-    st.markdown('### Violations', unsafe_allow_html=True)
-    
-    if st.session_state.detector and st.session_state.detector.violations:
-        viol_text = '<div class="violation-box">' + ''.join([
-            f'<p><strong>#{len(st.session_state.detector.violations)-i}</strong> {v["type"].title()} at {v["time"]}</p>'
-            for i, v in enumerate(reversed(st.session_state.detector.violations))
-        ]) + '</div>'
-    else:
-        viol_text = '<div class="violation-box">No violations yet.</div>'
-    
-    st.markdown(viol_text, unsafe_allow_html=True)
-
-    # Display total violations
-    if st.session_state.detector:
-        st.metric("Total Violations", st.session_state.detector.total_violations)
+    if not st.session_state.monitoring and st.session_state.cam is not None:
+        st.session_state.cam.release()
 
 
 def save_report(detector):
