@@ -574,7 +574,6 @@ def main():
                 "audio": False
             },
             async_processing=True,
-            skip_audio=True,
         )
 
     with col2:
