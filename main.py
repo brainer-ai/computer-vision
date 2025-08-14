@@ -7,6 +7,8 @@ import os
 from datetime import datetime
 import pygame
 import streamlit as st
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+import av
 
 # Optional: ultralytics YOLO
 try:
@@ -550,40 +552,18 @@ class ExamDetector:
             y += 24
 
 
-class CameraThread:
-    def __init__(self, src=0, max_q=4):
-        self.cap = cv2.VideoCapture(0)
-        self.q = queue.Queue(maxsize=max_q)
-        self.stopped = False
-        t = threading.Thread(target=self.update, daemon=True)
-        t.start()
+# Initialize global detector
+if 'detector' not in st.session_state:
+    st.session_state.detector = None
 
-    def update(self):
-        while not self.stopped:
-            if not self.cap.isOpened():
-                time.sleep(0.1)
-                continue
-            ret, frame = self.cap.read()
-            if not ret:
-                time.sleep(0.01)
-                continue
-            if self.q.full():
-                try:
-                    self.q.get_nowait()
-                except Exception:
-                    pass
-            self.q.put(frame)
-
-    def read(self):
-        try:
-            return self.q.get(timeout=1)
-        except Exception:
-            return None
-
-    def release(self):
-        self.stopped = True
-        if self.cap.isOpened():
-            self.cap.release()
+def video_frame_callback(frame):
+    img = frame.to_ndarray(format="bgr24")
+    
+    if st.session_state.detector is not None:
+        processed_img = st.session_state.detector.process(img)
+        return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
+    
+    return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
 def main():
@@ -592,20 +572,63 @@ def main():
 
     col1, col2 = st.columns([3, 1], gap="large")
 
+    # Sidebar: Settings
+    st.sidebar.header("Settings", divider="gray")
+    use_yolo_checkbox = st.sidebar.checkbox('✅ Use YOLO Detection', value=True, help="Enable YOLO for object detection")
+    enable_sound = st.sidebar.checkbox('🔊 Enable Sound Alerts', value=True, help="Play alert sounds on violations")
+
+    # Initialize detector button
+    if st.sidebar.button('🚀 Initialize Detector'):
+        try:
+            st.session_state.detector = ExamDetector(use_yolo=use_yolo_checkbox and YOLO_AVAILABLE, enable_sound=enable_sound)
+            st.sidebar.success('✅ Detector initialized!')
+        except Exception as e:
+            st.sidebar.error(f'❌ Detector initialization failed: {e}')
+
     with col1:
-        stframe = st.empty()
+        # WebRTC Configuration
+        RTC_CONFIGURATION = RTCConfiguration(
+            {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+        )
+
+        webrtc_ctx = webrtc_streamer(
+            key="exam-monitor",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration=RTC_CONFIGURATION,
+            video_frame_callback=video_frame_callback,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
 
     with col2:
         st.markdown('### Control Panel', unsafe_allow_html=True)
-        start = st.button('🟢 Start Monitoring', key='start', help="Start camera and monitoring", type="primary")
-        stop = st.button('🔴 Stop Monitoring', key='stop', help="Stop camera and monitoring")
+        
+        # Status indicator
+        if webrtc_ctx.state.playing:
+            st.success('🟢 Camera Active')
+        else:
+            st.info('🔴 Camera Inactive')
+        
+        # Control buttons
         save = st.button('💾 Save Report', key='save', help="Save violation report")
         reset = st.button('🔄 Reset Violations', key='reset', help="Clear all violations")
+        
         st.markdown('---')
         st.markdown('### Violations', unsafe_allow_html=True)
-        viol_list = st.markdown('<div class="violation-box">No violations yet.</div>', unsafe_allow_html=True)
+        
+        # Display violations
+        if st.session_state.detector and st.session_state.detector.violations:
+            viol_text = '<div class="violation-box">' + ''.join([
+                f'<p><strong>#{len(st.session_state.detector.violations)-i}</strong> {v["type"].title()} at {v["time"]}</p>'
+                for i, v in enumerate(reversed(st.session_state.detector.violations))
+            ]) + '</div>'
+        else:
+            viol_text = '<div class="violation-box">No violations yet.</div>'
+        
+        st.markdown(viol_text, unsafe_allow_html=True)
 
     # Sidebar: Detection Info
+    st.sidebar.markdown("---")
     st.sidebar.header("Detection Info", divider="gray")
     st.sidebar.markdown("""
     **Instant Detection:**
@@ -616,59 +639,15 @@ def main():
     - 🚶 Movement analysis
     """, unsafe_allow_html=True)
 
-    st.sidebar.markdown("---")
-    st.sidebar.header("Settings", divider="gray")
-    use_yolo_checkbox = st.sidebar.checkbox('✅ Use YOLO Detection', value=True, help="Enable YOLO for object detection")
-    enable_sound = st.sidebar.checkbox('🔊 Enable Sound Alerts', value=True, help="Play alert sounds on violations")
+    # Button actions
+    if save and st.session_state.detector:
+        save_report(st.session_state.detector)
+        st.success('✅ Report saved successfully')
 
-    if 'monitoring' not in st.session_state:
-        st.session_state.monitoring = False
-        st.session_state.detector = None
-        st.session_state.cam = None
-
-    if start and not st.session_state.monitoring:
-        st.session_state.cam = CameraThread()
-        st.session_state.detector = ExamDetector(use_yolo=use_yolo_checkbox and YOLO_AVAILABLE, enable_sound=enable_sound)
-        st.session_state.monitoring = True
-        st.success('✅ Monitoring started successfully')
-
-    if stop and st.session_state.monitoring:
-        if st.session_state.cam is not None:
-            st.session_state.cam.release()
-        st.session_state.monitoring = False
-        st.success('⏹️ Monitoring stopped')
-
-    try:
-        while st.session_state.monitoring:
-            frame = st.session_state.cam.read()
-            if frame is None:
-                continue
-            out = st.session_state.detector.process(frame)
-            stframe.image(out, channels='BGR', caption="Live Video Stream", use_container_width=True)
-
-            if st.session_state.detector.violations:
-                viol_text = '<div class="violation-box">' + ''.join([
-                    f'<p><strong>#{len(st.session_state.detector.violations)-i}</strong> {v["type"].title()} at {v["time"]}</p>'
-                    for i, v in enumerate(reversed(st.session_state.detector.violations))
-                ]) + '</div>'
-            else:
-                viol_text = '<div class="violation-box">No violations yet.</div>'
-            viol_list.markdown(viol_text, unsafe_allow_html=True)
-
-            if save:
-                save_report(st.session_state.detector)
-                st.success('✅ Report saved successfully')
-
-            if reset:
-                st.session_state.detector.violations = []
-                st.session_state.detector.total_violations = 0
-                st.success('🔄 Violations reset')
-
-    except Exception as e:
-        st.error(f'🚨 Error in monitoring loop: {e}')
-
-    if not st.session_state.monitoring and st.session_state.cam is not None:
-        st.session_state.cam.release()
+    if reset and st.session_state.detector:
+        st.session_state.detector.violations = []
+        st.session_state.detector.total_violations = 0
+        st.success('🔄 Violations reset')
 
 
 def save_report(detector):
