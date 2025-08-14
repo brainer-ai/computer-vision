@@ -1,6 +1,8 @@
-opencv-contrib-python
 streamlit
+streamlit-webrtc
+opencv-python-headless
 numpy
 pygame
-ultralytics
 mediapipe
+ultralytics
+av
