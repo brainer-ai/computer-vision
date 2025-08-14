@@ -1,6 +1,8 @@
-streamlit==1.29.0
-streamlit-webrtc==0.38.0
-opencv-python-headless==4.8.1.78
-numpy==1.24.3
-ultralytics==8.2.11
-mediapipe==0.10.9
+streamlit==1.36.0
+streamlit-webrtc==0.47.7
+av==11.0.0
+opencv-contrib-python-headless==4.10.0.84
+mediapipe==0.10.14
+ultralytics==8.3.0
+pygame==2.5.2
+numpy==1.26.4
