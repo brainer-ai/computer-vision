@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 import pygame
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import av
 
 # Optional: ultralytics YOLO
@@ -168,14 +168,8 @@ class ExamDetector:
         self.face_lost_threshold = 15
 
         self.enable_sound = enable_sound
-        if self.enable_sound:
-            try:
-                pygame.mixer.pre_init(frequency=22050, size=-16, channels=2, buffer=1024)
-                pygame.mixer.init()
-                self._generate_alert_sound()
-            except Exception as e:
-                print(f"Sound initialization failed: {e}")
-                self.enable_sound = False
+        # Sound disabled for cloud deployment
+        self.enable_sound = False
 
     def detect_face_mesh(self, frame):
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -383,47 +377,6 @@ class ExamDetector:
         avg_m = np.mean(self.movement_window)
         return avg_m > self.movement_threshold
 
-    def _generate_alert_sound(self):
-        try:
-            sample_rate = 22050
-            duration = 0.5
-            frequency = 800
-            frames = int(duration * sample_rate)
-            
-            arr = np.sin(2 * np.pi * frequency * np.linspace(0, duration, frames))
-            arr = (arr * 32767).astype(np.int16)
-            arr = np.ascontiguousarray(arr)
-            
-            stereo_arr = np.zeros((frames, 2), dtype=np.int16)
-            stereo_arr[:, 0] = arr
-            stereo_arr[:, 1] = arr
-            stereo_arr = np.ascontiguousarray(stereo_arr)
-            
-            self.alert_sound = pygame.sndarray.make_sound(stereo_arr)
-        except Exception as e:
-            print(f"Alert sound generation failed: {e}")
-            self.enable_sound = False
-
-    def _play_alert_sound(self, violation_type):
-        if self.enable_sound and hasattr(self, 'alert_sound'):
-            try:
-                if violation_type == 'absent':
-                    self.alert_sound.play()
-                elif violation_type == 'looking_away':
-                    self.alert_sound.play()
-                    time.sleep(0.1)
-                    self.alert_sound.play()
-                elif violation_type == 'movement':
-                    for i in range(3):
-                        self.alert_sound.play()
-                        if i < 2:
-                            time.sleep(0.05)
-                else:
-                    self.alert_sound.play()
-            except Exception as e:
-                print(f"Sound play error: {e}")
-                self.enable_sound = False
-
     def process(self, frame):
         self.frame_counter += 1
         annotated = frame.copy()
@@ -433,21 +386,25 @@ class ExamDetector:
         looking_forward = True
 
         if self.tracking and (self.frame_counter % self.detection_interval != 0):
-            ok, bbox = self.tracker.update(frame)
-            if ok:
-                x, y, w, h = map(int, bbox)
-                face_bbox = (x, y, w, h)
-                cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            else:
-                self.tracking = False
-                self.tracker = None
+            if self.tracker:
+                ok, bbox = self.tracker.update(frame)
+                if ok:
+                    x, y, w, h = map(int, bbox)
+                    face_bbox = (x, y, w, h)
+                    cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                else:
+                    self.tracking = False
+                    self.tracker = None
 
         if not self.tracking or (self.frame_counter % self.detection_interval == 0):
             res = self.detect_face_mesh(frame)
             if res[0] is not None:
                 face_bbox, left_right, looking_forward = res
                 x, y, w, h = face_bbox
-                self.tracker = cv2.TrackerCSRT_create()
+                try:
+                    self.tracker = cv2.legacy.TrackerCSRT_create()  # Legacy tracker for compatibility
+                except:
+                    self.tracker = cv2.TrackerCSRT_create()
                 self.tracker.init(frame, tuple(face_bbox))
                 self.tracking = True
                 cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
@@ -510,7 +467,6 @@ class ExamDetector:
                 t = datetime.now().strftime('%H:%M:%S')
                 self.violations.append({'type': vtype, 'time': t})
                 print(f'Violation: {vtype} at {t}')
-                self._play_alert_sound(vtype)
                 return  # لا تستمر في التراكم
 
             # باقي المخالفات (الوجه، الحركة...) تستخدم التراكم
@@ -525,7 +481,6 @@ class ExamDetector:
             t = datetime.now().strftime('%H:%M:%S')
             self.violations.append({'type': vtype, 'time': t})
             print(f'Violation: {vtype} at {t}')
-            self._play_alert_sound(vtype)
 
     def _draw_status(self, frame, face, eyes, gaze, phone, paper, movement):
         h, w = frame.shape[:2]
@@ -548,6 +503,14 @@ class ExamDetector:
             cv2.putText(frame, f'{label}: {txt}', (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             y += 24
 
+    def reset_violations(self):
+        """Reset all violations"""
+        self.violations = []
+        self.total_violations = 0
+        if hasattr(self, '_counters'):
+            for key in self._counters:
+                self._counters[key] = 0
+
 
 def save_report(detector):
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -559,6 +522,7 @@ def save_report(detector):
         for i, v in enumerate(detector.violations, 1):
             f.write(f"{i}. {v['type'].title()} at {v['time']}\n")
     st.toast(f"📄 Report saved: {fname}")
+    return fname
 
 
 def main():
@@ -579,10 +543,15 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.header("Settings", divider="gray")
     use_yolo_checkbox = st.sidebar.checkbox('✅ Use YOLO Detection', value=False, help="Enable YOLO for object detection")
-    enable_sound = st.sidebar.checkbox('🔊 Enable Sound Alerts', value=False, help="Play alert sounds on violations")
+    # Sound disabled for cloud deployment
+    enable_sound = False
 
-    # Initialize detector once
+    # Initialize detector in session state
     if 'detector' not in st.session_state:
+        st.session_state.detector = ExamDetector(use_yolo=use_yolo_checkbox, enable_sound=enable_sound)
+
+    # Update detector settings if changed
+    if st.session_state.detector.use_yolo != use_yolo_checkbox:
         st.session_state.detector = ExamDetector(use_yolo=use_yolo_checkbox, enable_sound=enable_sound)
 
     # Violations panel
@@ -591,45 +560,58 @@ def main():
         stframe = st.empty()
     with col2:
         st.markdown('### Control Panel', unsafe_allow_html=True)
-        save = st.button('💾 Save Report', key='save', help="Save violation report")
-        reset = st.button('🔄 Reset Violations', key='reset', help="Clear all violations")
+        save_btn = st.button('💾 Save Report', key='save', help="Save violation report", use_container_width=True)
+        reset_btn = st.button('🔄 Reset Violations', key='reset', help="Clear all violations", use_container_width=True)
         st.markdown('---')
         st.markdown('### Violations', unsafe_allow_html=True)
         viol_list = st.markdown('<div class="violation-box">No violations yet.</div>', unsafe_allow_html=True)
 
     # WebRTC Streamer
     class ExamProcessor(VideoProcessorBase):
+        def __init__(self) -> None:
+            self.detector = st.session_state.detector
+
         def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
             img = frame.to_ndarray(format="bgr24")
-            processed = st.session_state.detector.process(img)
+            processed = self.detector.process(img)
             return av.VideoFrame.from_ndarray(processed, format="bgr24")
 
     ctx = webrtc_streamer(
         key="exam-monitor",
-        video_processor_factory=ExamProcessor,
+        mode=WebRtcMode.SENDRECV,
         rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
         media_stream_constraints={"video": True, "audio": False},
+        video_processor_factory=ExamProcessor,
+        async_processing=True,
     )
 
-    # Update violations in real-time
-    if ctx.state.playing:
+    # Handle button actions
+    if save_btn:
         if st.session_state.detector.violations:
-            viol_text = '<div class="violation-box">' + ''.join([
-                f'<p><strong>#{len(st.session_state.detector.violations)-i}</strong> {v["type"].title()} at {v["time"]}</p>'
-                for i, v in enumerate(reversed(st.session_state.detector.violations))
-            ]) + '</div>'
+            fname = save_report(st.session_state.detector)
+            with open(fname, "rb") as f:
+                st.download_button(
+                    label="📥 Download Report",
+                    data=f,
+                    file_name=fname,
+                    mime="text/plain"
+                )
         else:
-            viol_text = '<div class="violation-box">No violations yet.</div>'
-        viol_list.markdown(viol_text, unsafe_allow_html=True)
+            st.warning("No violations to save!")
 
-    if save:
-        save_report(st.session_state.detector)
-        st.success('✅ Report saved successfully')
-
-    if reset:
-        st.session_state.detector.violations = []
-        st.session_state.detector.total_violations = 0
+    if reset_btn:
+        st.session_state.detector.reset_violations()
         st.success('🔄 Violations reset')
+
+    # Update violations display
+    if st.session_state.detector.violations:
+        viol_text = '<div class="violation-box">' + ''.join([
+            f'<p><strong>#{len(st.session_state.detector.violations)-i}</strong> {v["type"].title()} at {v["time"]}</p>'
+            for i, v in enumerate(reversed(st.session_state.detector.violations))
+        ]) + '</div>'
+    else:
+        viol_text = '<div class="violation-box">No violations yet.</div>'
+    viol_list.markdown(viol_text, unsafe_allow_html=True)
 
 
 if __name__ == '__main__':
