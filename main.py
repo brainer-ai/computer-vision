@@ -1,12 +1,11 @@
 import cv2
-import threading
 import time
 import numpy as np
-import queue
-import os
 from datetime import datetime
 import pygame
 import streamlit as st
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
+import av
 
 # Optional: ultralytics YOLO
 try:
@@ -67,27 +66,6 @@ st.markdown("""
         transform: translateY(-2px);
         box-shadow: 0 6px 12px rgba(0,0,0,0.1);
     }
-    .start-btn {
-        background-color: #28a745;
-        color: white;
-    }
-    .stop-btn {
-        background-color: #dc3545;
-        color: white;
-    }
-    .save-btn {
-        background-color: #007bff;
-        color: white;
-    }
-    .reset-btn {
-        background-color: #ffc107;
-        color: #212529;
-    }
-    .stImage {
-        border: 2px solid #c5d9f1;
-        border-radius: 12px;
-        box-shadow: 0 6px 16px rgba(0,0,0,0.12);
-    }
     .violation-box {
         background-color: #000;
         color: #0f0;
@@ -104,25 +82,22 @@ st.markdown("""
         margin: 8px 0;
         color: #00ff88;
     }
-    .sidebar .stCheckbox > label, .sidebar .stRadio > label {
-        font-size: 16px;
-        color: #1a3c5a;
-        font-weight: 500;
+    .stats-container {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 20px;
+        border-radius: 12px;
+        margin: 10px 0;
     }
-    .sidebar .stMarkdown h3 {
-        color: #1a3c5a;
-        font-size: 1.3rem;
-        margin-bottom: 12px;
+    .stats-number {
+        font-size: 2.5rem;
+        font-weight: bold;
+        text-align: center;
     }
-    [data-testid="column"] > div > .stMarkdown > div:first-child {
-        font-weight: 600;
-        color: #1a3c5a;
-        font-size: 1.25rem;
-        margin-bottom: 16px;
-    }
-    hr {
-        border-color: #ddd;
-        margin: 15px 0;
+    .stats-label {
+        font-size: 1rem;
+        text-align: center;
+        opacity: 0.9;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -134,15 +109,13 @@ class ExamDetector:
             raise RuntimeError("MediaPipe is required. Install mediapipe package.")
 
         self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(static_image_mode=False,
-                                                    max_num_faces=1,
-                                                    refine_landmarks=True,
-                                                    min_detection_confidence=0.5,
-                                                    min_tracking_confidence=0.5)
-
-        self.tracker = None
-        self.tracking = False
-        self.track_init_bbox = None
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
 
         self.prev_gray = None
         self.movement_window = []
@@ -164,7 +137,6 @@ class ExamDetector:
 
         self.detection_interval = 3
         self.frame_counter = 0
-        
         self.face_lost_counter = 0
         self.face_lost_threshold = 15
 
@@ -178,22 +150,36 @@ class ExamDetector:
                 print(f"Sound initialization failed: {e}")
                 self.enable_sound = False
 
+        # إضافة متغيرات للتتبع
+        self._counters = {k: 0 for k in ['absent', 'looking_away', 'phone', 'paper', 'movement']}
+        self._thresholds = {
+            'absent': 50,
+            'looking_away': 100,
+            'phone': 5,
+            'paper': 3,
+            'movement': 110
+        }
+
     def detect_face_mesh(self, frame):
+        """اكتشاف الوجه باستخدام MediaPipe Face Mesh"""
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(img_rgb)
         h, w = frame.shape[:2]
+        
         if not results.multi_face_landmarks:
             return None, None, None
 
         face_landmarks = results.multi_face_landmarks[0]
         pts = [(int(lm.x * w), int(lm.y * h)) for lm in face_landmarks.landmark]
 
+        # حساب حدود الوجه
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         x1, y1 = max(min(xs) - 10, 0), max(min(ys) - 10, 0)
         x2, y2 = min(max(xs) + 10, w - 1), min(max(ys) + 10, h - 1)
         bbox = (x1, y1, x2 - x1, y2 - y1)
 
+        # اكتشاف العينين
         left_eye_idx = [33, 133, 160, 159, 158, 157, 173]
         right_eye_idx = [263, 362, 387, 386, 385, 384, 398]
 
@@ -208,6 +194,7 @@ class ExamDetector:
         left_center = mean_point(left_eye_idx)
         right_center = mean_point(right_eye_idx)
 
+        # تحديد اتجاه النظر
         looking_forward = True
         if left_center and right_center:
             eye_x = (left_center[0] + right_center[0]) / 2
@@ -218,6 +205,7 @@ class ExamDetector:
         return bbox, (left_center, right_center), looking_forward
 
     def detect_objects_yolo(self, frame):
+        """اكتشاف الكائنات باستخدام YOLO"""
         phone_detected = False
         paper_detected = False
         CONF_THRESHOLD = 0.3
@@ -240,21 +228,17 @@ class ExamDetector:
                     if area < MIN_AREA or area > MAX_AREA:
                         continue
 
-                    phone_classes = [
-                        'cell phone', 'mobile phone', 'phone', 'smartphone',
-                        'iphone', 'android', 'tablet', 'remote'
-                    ]
+                    phone_classes = ['cell phone', 'mobile phone', 'phone', 'smartphone',
+                                   'iphone', 'android', 'tablet', 'remote']
                     if any(phone_class in name for phone_class in phone_classes) and conf >= CONF_THRESHOLD:
                         phone_detected = True
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
                         cv2.putText(frame, f'Phone: {conf:.2f}', (x1, y1-10), 
                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
-                    paper_classes = [
-                        'book', 'paper', 'notebook', 'magazine', 
-                        'newspaper', 'document', 'letter', 'card',
-                        'envelope', 'file'
-                    ]
+                    paper_classes = ['book', 'paper', 'notebook', 'magazine', 
+                                   'newspaper', 'document', 'letter', 'card',
+                                   'envelope', 'file']
                     if any(paper_class in name for paper_class in paper_classes) and conf >= CONF_THRESHOLD:
                         paper_detected = True
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
@@ -268,11 +252,13 @@ class ExamDetector:
         return phone_detected, paper_detected
 
     def detect_objects_heuristic(self, frame):
+        """اكتشاف الكائنات باستخدام الطرق التقليدية"""
         phone = self.detect_phone_advanced(frame)
         paper = self.detect_paper_advanced(frame)
         return phone, paper
 
     def detect_phone_advanced(self, frame):
+        """اكتشاف الهاتف المتقدم"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray, 60, 255, cv2.THRESH_BINARY_INV)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -288,29 +274,10 @@ class ExamDetector:
                         mean_intensity = np.mean(roi)
                         if mean_intensity < 100:
                             return True
-        
-        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80, minLineLength=50, maxLineGap=10)
-        
-        if lines is not None:
-            vertical_lines = []
-            horizontal_lines = []
-            
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
-                angle = np.arctan2(y2-y1, x2-x1) * 180.0 / np.pi
-                
-                if abs(angle) < 15 or abs(angle) > 165:
-                    horizontal_lines.append(line)
-                elif 75 < abs(angle) < 105:
-                    vertical_lines.append(line)
-            
-            if len(horizontal_lines) >= 2 and len(vertical_lines) >= 2:
-                return True
-        
         return False
 
     def detect_paper_advanced(self, frame):
+        """اكتشاف الورق المتقدم"""
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         lower_white = np.array([0, 0, 180])
         upper_white = np.array([180, 50, 255])
@@ -332,59 +299,29 @@ class ExamDetector:
                     approx = cv2.approxPolyDP(cnt, 0.02 * perimeter, True)
                     if len(approx) >= 4:
                         return True
-        
-        lower_cream = np.array([15, 30, 200])
-        upper_cream = np.array([35, 80, 255])
-        
-        mask_cream = cv2.inRange(hsv, lower_cream, upper_cream)
-        contours_cream, _ = cv2.findContours(mask_cream, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for cnt in contours_cream:
-            if cv2.contourArea(cnt) > 12000:
-                return True
-        
-        return False
-
-    def detect_dark_rectangles(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if 4000 < area < 30000:
-                x, y, w, h = cv2.boundingRect(cnt)
-                ar = w / float(h) if h else 0
-                if 0.3 < ar < 2.5:
-                    return True
-        return False
-
-    def detect_white_areas(self, frame):
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        lower = np.array([0, 0, 200])
-        upper = np.array([180, 60, 255])
-        mask = cv2.inRange(hsv, lower, upper)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            if cv2.contourArea(cnt) > 25000:
-                return True
         return False
 
     def detect_movement(self, frame):
+        """اكتشاف الحركة المفرطة"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if self.prev_gray is None:
             self.prev_gray = gray
             return False
+        
         diff = cv2.absdiff(self.prev_gray, gray)
         _, th = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
         movement = np.sum(th)
         self.prev_gray = gray
+        
         self.movement_window.append(movement)
         if len(self.movement_window) > 20:
             self.movement_window.pop(0)
+        
         avg_m = np.mean(self.movement_window)
         return avg_m > self.movement_threshold
 
     def _generate_alert_sound(self):
+        """توليد صوت التنبيه"""
         try:
             sample_rate = 22050
             duration = 0.5
@@ -406,6 +343,7 @@ class ExamDetector:
             self.enable_sound = False
 
     def _play_alert_sound(self, violation_type):
+        """تشغيل صوت التنبيه"""
         if self.enable_sound and hasattr(self, 'alert_sound'):
             try:
                 if violation_type == 'absent':
@@ -425,41 +363,84 @@ class ExamDetector:
                 print(f"Sound play error: {e}")
                 self.enable_sound = False
 
+    def _accumulate_violation(self, vtype, flag):
+        """تجميع المخالفات"""
+        if flag:
+            # الهاتف والورق يتم تسجيلهما فورًا
+            if vtype in ['phone', 'paper']:
+                self.total_violations += 1
+                t = datetime.now().strftime('%H:%M:%S')
+                self.violations.append({'type': vtype, 'time': t})
+                print(f'Violation: {vtype} at {t}')
+                self._play_alert_sound(vtype)
+                return
+
+            # باقي المخالفات تستخدم التراكم
+            self._counters[vtype] += 1
+        else:
+            self._counters[vtype] = max(0, self._counters[vtype] - 2)
+
+        # التحقق من تجاوز العتبة
+        if self._counters[vtype] > self._thresholds[vtype]:
+            self._counters[vtype] = 0
+            self.total_violations += 1
+            t = datetime.now().strftime('%H:%M:%S')
+            self.violations.append({'type': vtype, 'time': t})
+            print(f'Violation: {vtype} at {t}')
+            self._play_alert_sound(vtype)
+
+    def _draw_status(self, frame, face, eyes, gaze, phone, paper, movement):
+        """رسم حالة المراقبة على الإطار"""
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (420, 140), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+        
+        y = 35
+        cv2.putText(frame, f'Total Violations: {self.total_violations}', 
+                   (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+        y += 30
+        
+        items = [
+            ('Face', face), 
+            ('Movement Normal', not movement),
+            ('Phone Clear', not phone),
+            ('Paper Clear', not paper)
+        ]
+        
+        for label, ok in items:
+            color = (0,255,0) if ok else (0,0,255)
+            txt = 'OK' if ok else 'VIOLATION'
+            cv2.putText(frame, f'{label}: {txt}', 
+                       (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            y += 24
+
     def process(self, frame):
+        """معالجة الإطار الرئيسية"""
         self.frame_counter += 1
         annotated = frame.copy()
 
+        # اكتشاف الوجه
         face_bbox = None
         left_right = (None, None)
         looking_forward = True
 
-        if self.tracking and (self.frame_counter % self.detection_interval != 0):
-            ok, bbox = self.tracker.update(frame)
-            if ok:
-                x, y, w, h = map(int, bbox)
-                face_bbox = (x, y, w, h)
-                cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            else:
-                self.tracking = False
-                self.tracker = None
+        res = self.detect_face_mesh(frame)
+        if res[0] is not None:
+            face_bbox, left_right, looking_forward = res
+            x, y, w, h = face_bbox
+            cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-        if not self.tracking or (self.frame_counter % self.detection_interval == 0):
-            res = self.detect_face_mesh(frame)
-            if res[0] is not None:
-                face_bbox, left_right, looking_forward = res
-                x, y, w, h = face_bbox
-                self.tracker = cv2.TrackerCSRT_create()
-                self.tracker.init(frame, tuple(face_bbox))
-                self.tracking = True
-                cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
+        # اكتشاف الكائنات
         if self.use_yolo:
             phone, paper = self.detect_objects_yolo(annotated)
         else:
             phone, paper = self.detect_objects_heuristic(annotated)
 
+        # اكتشاف الحركة المفرطة
         excessive_movement = self.detect_movement(frame)
 
+        # تسجيل المخالفات
         if face_bbox is None:
             self.face_lost_counter += 1
             if self.face_lost_counter > self.face_lost_threshold:
@@ -488,199 +469,194 @@ class ExamDetector:
         else:
             self._accumulate_violation('movement', 0)
 
+        # رسم المعلومات على الإطار
         self._draw_status(annotated, face_bbox is not None, left_right[0] is not None,
                         looking_forward, phone, paper, excessive_movement)
 
         return annotated
 
-    def _accumulate_violation(self, vtype, flag):
-        if not hasattr(self, '_counters'):
-            self._counters = {k: 0 for k in ['absent', 'looking_away', 'phone', 'paper', 'movement']}
-            self._thresholds = {
-                'absent': 50,
-                'looking_away': 100,
-                'phone': 5,
-                'paper': 3,
-                'movement': 110
-            }
 
-        if flag:
-            # 🔥 الهاتف والورق يتم تسجيلهما فورًا بدون تراكم
-            if vtype in ['phone', 'paper']:
-                self.total_violations += 1
-                t = datetime.now().strftime('%H:%M:%S')
-                self.violations.append({'type': vtype, 'time': t})
-                print(f'Violation: {vtype} at {t}')
-                self._play_alert_sound(vtype)
-                return  # لا تستمر في التراكم
-
-            # باقي المخالفات (الوجه، الحركة...) تستخدم التراكم
-            self._counters[vtype] += 1
-        else:
-            self._counters[vtype] = max(0, self._counters[vtype] - 2)
-
-        # التحقق من تجاوز العتبة للبقية فقط
-        if self._counters[vtype] > self._thresholds[vtype]:
-            self._counters[vtype] = 0
-            self.total_violations += 1
-            t = datetime.now().strftime('%H:%M:%S')
-            self.violations.append({'type': vtype, 'time': t})
-            print(f'Violation: {vtype} at {t}')
-            self._play_alert_sound(vtype)
-
-    def _draw_status(self, frame, face, eyes, gaze, phone, paper, movement):
-        h, w = frame.shape[:2]
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (420, 140), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-        y = 35
-        cv2.putText(frame, f'Total Violations: {self.total_violations}', (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
-        y += 30
+class VideoTransformer(VideoTransformerBase):
+    """فئة معالجة الفيديو باستخدام VideoTransformerBase"""
+    
+    def __init__(self):
+        self.detector = None
+    
+    def set_detector(self, detector):
+        """تعيين كاشف المخالفات"""
+        self.detector = detector
+    
+    def transform(self, frame):
+        """معالجة إطارات الفيديو"""
+        img = frame.to_ndarray(format="bgr24")
         
-        items = [
-            ('Face', face), 
-            ('Movement Normal', not movement),
-            ('Phone Clear', not phone),
-            ('Paper Clear', not paper)
-        ]
-        for label, ok in items:
-            color = (0,255,0) if ok else (0,0,255)
-            txt = 'OK' if ok else 'VIOLATION'
-            cv2.putText(frame, f'{label}: {txt}', (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            y += 24
+        # إذا تم تعيين الكاشف، قم بمعالجة الإطار
+        if self.detector is not None:
+            try:
+                img = self.detector.process(img)
+            except Exception as e:
+                print(f"Error in frame processing: {e}")
+                # في حالة حدوث خطأ، ارجع الإطار الأصلي
+                pass
+        
+        return img
 
 
-class CameraThread:
-    def __init__(self, src=0, max_q=4):
-        self.cap = cv2.VideoCapture(0)
-        self.q = queue.Queue(maxsize=max_q)
-        self.stopped = False
-        t = threading.Thread(target=self.update, daemon=True)
-        t.start()
+# إعداد WebRTC
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
 
-    def update(self):
-        while not self.stopped:
-            if not self.cap.isOpened():
-                time.sleep(0.1)
-                continue
-            ret, frame = self.cap.read()
-            if not ret:
-                time.sleep(0.01)
-                continue
-            if self.q.full():
-                try:
-                    self.q.get_nowait()
-                except Exception:
-                    pass
-            self.q.put(frame)
+# متغيرات عامة للتطبيق
+if 'detector' not in st.session_state:
+    st.session_state.detector = None
 
-    def read(self):
-        try:
-            return self.q.get(timeout=1)
-        except Exception:
-            return None
-
-    def release(self):
-        self.stopped = True
-        if self.cap.isOpened():
-            self.cap.release()
+if 'video_transformer' not in st.session_state:
+    st.session_state.video_transformer = VideoTransformer()
 
 
 def main():
-    st.markdown('<div class="title">🎓 Exam Monitor</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subtitle">AI-powered exam proctoring with face tracking and object detection</div>', unsafe_allow_html=True)
+    st.markdown('<div class="title">🎓 Exam Monitor with WebRTC</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">AI-powered exam proctoring with real-time camera streaming</div>', unsafe_allow_html=True)
 
-    col1, col2 = st.columns([3, 1], gap="large")
+    # الشريط الجانبي للإعدادات
+    st.sidebar.header("⚙️ Settings", divider="gray")
+    use_yolo_checkbox = st.sidebar.checkbox('✅ Use YOLO Detection', value=YOLO_AVAILABLE, 
+                                           help="Enable YOLO for object detection")
+    enable_sound = st.sidebar.checkbox('🔊 Enable Sound Alerts', value=True, 
+                                      help="Play alert sounds on violations")
 
-    with col1:
-        stframe = st.empty()
+    # إعداد الكاشف
+    if st.sidebar.button("🚀 Initialize Detector"):
+        try:
+            st.session_state.detector = ExamDetector(
+                use_yolo=use_yolo_checkbox and YOLO_AVAILABLE,
+                enable_sound=enable_sound
+            )
+            st.session_state.video_transformer.set_detector(st.session_state.detector)
+            st.sidebar.success("✅ Detector initialized!")
+        except Exception as e:
+            st.sidebar.error(f"❌ Error initializing detector: {e}")
 
-    with col2:
-        st.markdown('### Control Panel', unsafe_allow_html=True)
-        start = st.button('🟢 Start Monitoring', key='start', help="Start camera and monitoring", type="primary")
-        stop = st.button('🔴 Stop Monitoring', key='stop', help="Stop camera and monitoring")
-        save = st.button('💾 Save Report', key='save', help="Save violation report")
-        reset = st.button('🔄 Reset Violations', key='reset', help="Clear all violations")
-        st.markdown('---')
-        st.markdown('### Violations', unsafe_allow_html=True)
-        viol_list = st.markdown('<div class="violation-box">No violations yet.</div>', unsafe_allow_html=True)
-
-    # Sidebar: Detection Info
-    st.sidebar.header("Detection Info", divider="gray")
+    st.sidebar.markdown("---")
+    st.sidebar.header("📊 Detection Info", divider="gray")
     st.sidebar.markdown("""
     **Instant Detection:**
     - 📱 Phone: Immediate alert
     - 📄 Paper: Immediate alert
-    - 👁️ Face tracking
-    - 🔍 Gaze monitoring
+    - 👁️ Face tracking with MediaPipe
+    - 🔍 Gaze direction monitoring
     - 🚶 Movement analysis
-    """, unsafe_allow_html=True)
+    
+    **Status:**
+    """ + (f"✅ YOLO Available" if YOLO_AVAILABLE else "⚠️ YOLO Not Available") + """
+    """ + (f"✅ MediaPipe Available" if MP_AVAILABLE else "❌ MediaPipe Not Available"))
 
-    st.sidebar.markdown("---")
-    st.sidebar.header("Settings", divider="gray")
-    use_yolo_checkbox = st.sidebar.checkbox('✅ Use YOLO Detection', value=True, help="Enable YOLO for object detection")
-    enable_sound = st.sidebar.checkbox('🔊 Enable Sound Alerts', value=True, help="Play alert sounds on violations")
+    # التخطيط الرئيسي
+    col1, col2 = st.columns([3, 1], gap="large")
 
-    if 'monitoring' not in st.session_state:
-        st.session_state.monitoring = False
-        st.session_state.detector = None
-        st.session_state.cam = None
+    with col1:
+        st.header("📹 Live Camera Stream")
+        
+        # بث الكاميرا باستخدام WebRTC
+        webrtc_ctx = webrtc_streamer(
+            key="exam-monitor",
+            video_transformer_factory=lambda: st.session_state.video_transformer,
+            rtc_configuration=RTC_CONFIGURATION,
+            media_stream_constraints={"video": True, "audio": False},
+        )
 
-    if start and not st.session_state.monitoring:
-        st.session_state.cam = CameraThread()
-        st.session_state.detector = ExamDetector(use_yolo=use_yolo_checkbox and YOLO_AVAILABLE, enable_sound=enable_sound)
-        st.session_state.monitoring = True
-        st.success('✅ Monitoring started successfully')
+        if webrtc_ctx.state.playing:
+            st.success("🟢 Camera is active and monitoring")
+            
+            # تحديث الكاشف إذا لم يتم تعيينه بعد
+            if (st.session_state.detector is not None and 
+                st.session_state.video_transformer.detector is None):
+                st.session_state.video_transformer.set_detector(st.session_state.detector)
+                
+        else:
+            st.info("📷 Click 'START' to begin monitoring")
 
-    if stop and st.session_state.monitoring:
-        if st.session_state.cam is not None:
-            st.session_state.cam.release()
-        st.session_state.monitoring = False
-        st.success('⏹️ Monitoring stopped')
+    with col2:
+        st.header("🎛️ Control Panel")
+        
+        # الإحصائيات
+        if st.session_state.detector is not None:
+            st.markdown(f"""
+            <div class="stats-container">
+                <div class="stats-number">{st.session_state.detector.total_violations}</div>
+                <div class="stats-label">Total Violations</div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div class="stats-container">
+                <div class="stats-number">0</div>
+                <div class="stats-label">Initialize Detector First</div>
+            </div>
+            """, unsafe_allow_html=True)
 
-    try:
-        while st.session_state.monitoring:
-            frame = st.session_state.cam.read()
-            if frame is None:
-                continue
-            out = st.session_state.detector.process(frame)
-            stframe.image(out, channels='BGR', caption="Live Video Stream", use_container_width=True)
-
-            if st.session_state.detector.violations:
-                viol_text = '<div class="violation-box">' + ''.join([
-                    f'<p><strong>#{len(st.session_state.detector.violations)-i}</strong> {v["type"].title()} at {v["time"]}</p>'
-                    for i, v in enumerate(reversed(st.session_state.detector.violations))
-                ]) + '</div>'
-            else:
-                viol_text = '<div class="violation-box">No violations yet.</div>'
-            viol_list.markdown(viol_text, unsafe_allow_html=True)
-
-            if save:
+        # أزرار التحكم
+        if st.button('💾 Save Report', key='save', help="Save violation report", use_container_width=True):
+            if st.session_state.detector is not None:
                 save_report(st.session_state.detector)
                 st.success('✅ Report saved successfully')
+            else:
+                st.error('❌ No detector initialized')
 
-            if reset:
+        if st.button('🔄 Reset Violations', key='reset', help="Clear all violations", use_container_width=True):
+            if st.session_state.detector is not None:
                 st.session_state.detector.violations = []
                 st.session_state.detector.total_violations = 0
                 st.success('🔄 Violations reset')
+            else:
+                st.error('❌ No detector initialized')
 
-    except Exception as e:
-        st.error(f'🚨 Error in monitoring loop: {e}')
+        st.markdown('---')
+        st.header('📋 Recent Violations')
+        
+        # عرض المخالفات
+        if st.session_state.detector is not None and st.session_state.detector.violations:
+            violations_text = '<div class="violation-box">' + ''.join([
+                f'<p><strong>#{len(st.session_state.detector.violations)-i}</strong> '
+                f'{v["type"].title().replace("_", " ")} at {v["time"]}</p>'
+                for i, v in enumerate(reversed(st.session_state.detector.violations[-10:]))  # أحدث 10 مخالفات
+            ]) + '</div>'
+            st.markdown(violations_text, unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="violation-box">No violations detected yet.</div>', 
+                       unsafe_allow_html=True)
 
-    if not st.session_state.monitoring and st.session_state.cam is not None:
-        st.session_state.cam.release()
+        # تحديث في الوقت الفعلي
+        if webrtc_ctx.state.playing and st.session_state.detector is not None:
+            # تحديث تلقائي كل ثانية
+            time.sleep(0.1)
+            st.rerun()
 
 
 def save_report(detector):
+    """حفظ تقرير المراقبة"""
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     fname = f'exam_report_{timestamp}.txt'
+    
     with open(fname, 'w', encoding='utf-8') as f:
         f.write('=== Exam Monitoring Report ===\n')
         f.write(f'Date: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
         f.write(f'Total Violations: {detector.total_violations}\n\n')
-        for i, v in enumerate(detector.violations, 1):
-            f.write(f"{i}. {v['type'].title()} at {v['time']}\n")
-    st.toast(f"📄 Report saved: {fname}")
+        f.write('Violation Details:\n')
+        f.write('-' * 40 + '\n')
+        
+        if detector.violations:
+            for i, v in enumerate(detector.violations, 1):
+                violation_name = v['type'].title().replace('_', ' ')
+                f.write(f"{i:2d}. {violation_name:<15} at {v['time']}\n")
+        else:
+            f.write("No violations recorded.\n")
+        
+        f.write('\n' + '=' * 50 + '\n')
+        f.write('Report generated by Exam Monitor System\n')
+    
+    st.success(f"📄 Report saved as: {fname}")
 
 
 if __name__ == '__main__':
