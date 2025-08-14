@@ -1,11 +1,10 @@
 import cv2
-import threading
 import time
 import numpy as np
 from datetime import datetime
 import pygame
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
 import av
 
 # Optional: ultralytics YOLO
@@ -118,8 +117,6 @@ class ExamDetector:
             min_tracking_confidence=0.5
         )
 
-        self.tracker = None
-        self.tracking = False
         self.prev_gray = None
         self.movement_window = []
         self.movement_threshold = 80000
@@ -479,23 +476,52 @@ class ExamDetector:
         return annotated
 
 
-# إعداد WebRTC
+class VideoTransformer(VideoTransformerBase):
+    """فئة معالجة الفيديو باستخدام VideoTransformerBase"""
+    
+    def __init__(self):
+        self.detector = None
+    
+    def set_detector(self, detector):
+        """تعيين كاشف المخالفات"""
+        self.detector = detector
+    
+    def transform(self, frame):
+        """معالجة إطارات الفيديو"""
+        img = frame.to_ndarray(format="bgr24")
+        
+        # إذا تم تعيين الكاشف، قم بمعالجة الإطار
+        if self.detector is not None:
+            try:
+                img = self.detector.process(img)
+            except Exception as e:
+                print(f"Error in frame processing: {e}")
+                # في حالة حدوث خطأ، ارجع الإطار الأصلي
+                pass
+        
+        return img
+
+
+# إعداد WebRTC محسن لتجنب مشاكل الاتصال
 RTC_CONFIGURATION = RTCConfiguration({
-    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+    "iceServers": [
+        {
+            "urls": [
+                "stun:stun.l.google.com:19302",
+                "stun:stun1.l.google.com:19302",
+                "stun:stun2.l.google.com:19302"
+            ]
+        }
+    ],
+    "iceCandidatePoolSize": 10,
 })
 
 # متغيرات عامة للتطبيق
 if 'detector' not in st.session_state:
     st.session_state.detector = None
 
-def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
-    """معالجة إطارات الفيديو من WebRTC"""
-    img = frame.to_ndarray(format="bgr24")
-    
-    if st.session_state.detector is not None:
-        img = st.session_state.detector.process(img)
-    
-    return av.VideoFrame.from_ndarray(img, format="bgr24")
+if 'video_transformer' not in st.session_state:
+    st.session_state.video_transformer = VideoTransformer()
 
 
 def main():
@@ -516,6 +542,7 @@ def main():
                 use_yolo=use_yolo_checkbox and YOLO_AVAILABLE,
                 enable_sound=enable_sound
             )
+            st.session_state.video_transformer.set_detector(st.session_state.detector)
             st.sidebar.success("✅ Detector initialized!")
         except Exception as e:
             st.sidebar.error(f"❌ Error initializing detector: {e}")
@@ -540,18 +567,28 @@ def main():
     with col1:
         st.header("📹 Live Camera Stream")
         
-        # بث الكاميرا باستخدام WebRTC
-        webrtc_ctx = webrtc_streamer(
-            key="exam-monitor",
-            mode=WebRtcMode.SENDRECV,
-            rtc_configuration=RTC_CONFIGURATION,
-            video_frame_callback=video_frame_callback,
-            media_stream_constraints={"video": True, "audio": False},
-            async_processing=True,
-        )
+        # بث الكاميرا باستخدام WebRTC مع معالجة الأخطاء
+        try:
+            webrtc_ctx = webrtc_streamer(
+                key="exam-monitor",
+                video_transformer_factory=lambda: st.session_state.video_transformer,
+                rtc_configuration=RTC_CONFIGURATION,
+                media_stream_constraints={"video": True, "audio": False},
+                async_processing=True,  # تمكين المعالجة غير المتزامنة
+            )
+        except Exception as e:
+            st.error(f"❌ WebRTC connection error: {e}")
+            st.info("💡 Try refreshing the page or check your camera permissions")
+            return
 
         if webrtc_ctx.state.playing:
             st.success("🟢 Camera is active and monitoring")
+            
+            # تحديث الكاشف إذا لم يتم تعيينه بعد
+            if (st.session_state.detector is not None and 
+                st.session_state.video_transformer.detector is None):
+                st.session_state.video_transformer.set_detector(st.session_state.detector)
+                
         else:
             st.info("📷 Click 'START' to begin monitoring")
 
@@ -604,6 +641,16 @@ def main():
         else:
             st.markdown('<div class="violation-box">No violations detected yet.</div>', 
                        unsafe_allow_html=True)
+
+        # تحديث في الوقت الفعلي مع معالجة الأخطاء
+        try:
+            if webrtc_ctx.state.playing and st.session_state.detector is not None:
+                # تحديث تلقائي كل ثانية
+                time.sleep(0.1)
+                st.rerun()
+        except Exception as e:
+            # تجاهل الأخطاء في التحديث التلقائي
+            pass
 
 
 def save_report(detector):
