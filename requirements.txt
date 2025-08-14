@@ -1,9 +1,7 @@
-streamlit>=1.28.0
-streamlit-webrtc>=0.47.0
-opencv-python>=4.8.0
-mediapipe>=0.10.0
-numpy>=1.24.0
-pygame>=2.5.0
-ultralytics>=8.0.0
-av>=10.0.0
-aiortc>=1.5.0
+streamlit==1.31.1
+streamlit-webrtc==0.47.7
+opencv-python-headless
+numpy
+pygame
+mediapipe
+ultralytics  # Optional, if using YOLO
