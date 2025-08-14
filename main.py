@@ -1,10 +1,14 @@
 import cv2
+import threading
 import time
 import numpy as np
+import queue
 import os
 from datetime import datetime
 import pygame
 import streamlit as st
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
+import av
 
 # Optional: ultralytics YOLO
 try:
@@ -20,22 +24,16 @@ try:
 except Exception:
     MP_AVAILABLE = False
 
-# WebRTC (browser webcam)
-from streamlit_webrtc import webrtc_streamer, WebRtcMode
-import av
-
-# ============================
-# Streamlit page config & CSS
-# ============================
+# Streamlit page config
 st.set_page_config(
     page_title="Exam Monitor",
     page_icon="🎓",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
 
-st.markdown(
-    """
+# Custom CSS for enhanced UI
+st.markdown("""
 <style>
     .main {
         background-color: #f4f7fa;
@@ -71,10 +69,22 @@ st.markdown(
         transform: translateY(-2px);
         box-shadow: 0 6px 12px rgba(0,0,0,0.1);
     }
-    .start-btn { background-color: #28a745; color: white; }
-    .stop-btn { background-color: #dc3545; color: white; }
-    .save-btn { background-color: #007bff; color: white; }
-    .reset-btn { background-color: #ffc107; color: #212529; }
+    .start-btn {
+        background-color: #28a745;
+        color: white;
+    }
+    .stop-btn {
+        background-color: #dc3545;
+        color: white;
+    }
+    .save-btn {
+        background-color: #007bff;
+        color: white;
+    }
+    .reset-btn {
+        background-color: #ffc107;
+        color: #212529;
+    }
     .stImage {
         border: 2px solid #c5d9f1;
         border-radius: 12px;
@@ -92,36 +102,45 @@ st.markdown(
         line-height: 1.6;
         border: 1px solid #333;
     }
-    .violation-box p { margin: 8px 0; color: #00ff88; }
+    .violation-box p {
+        margin: 8px 0;
+        color: #00ff88;
+    }
     .sidebar .stCheckbox > label, .sidebar .stRadio > label {
-        font-size: 16px; color: #1a3c5a; font-weight: 500;
+        font-size: 16px;
+        color: #1a3c5a;
+        font-weight: 500;
     }
-    .sidebar .stMarkdown h3 { color: #1a3c5a; font-size: 1.3rem; margin-bottom: 12px; }
+    .sidebar .stMarkdown h3 {
+        color: #1a3c5a;
+        font-size: 1.3rem;
+        margin-bottom: 12px;
+    }
     [data-testid="column"] > div > .stMarkdown > div:first-child {
-        font-weight: 600; color: #1a3c5a; font-size: 1.25rem; margin-bottom: 16px;
+        font-weight: 600;
+        color: #1a3c5a;
+        font-size: 1.25rem;
+        margin-bottom: 16px;
     }
-    hr { border-color: #ddd; margin: 15px 0; }
+    hr {
+        border-color: #ddd;
+        margin: 15px 0;
+    }
 </style>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
-# ============================
-# Core Detection Logic
-# ============================
+
 class ExamDetector:
-    def __init__(self, use_yolo=YOLO_AVAILABLE, enable_sound=False):
+    def __init__(self, use_yolo=YOLO_AVAILABLE, enable_sound=True):
         if not MP_AVAILABLE:
             raise RuntimeError("MediaPipe is required. Install mediapipe package.")
 
         self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
+        self.face_mesh = self.mp_face_mesh.FaceMesh(static_image_mode=False,
+                                                    max_num_faces=1,
+                                                    refine_landmarks=True,
+                                                    min_detection_confidence=0.5,
+                                                    min_tracking_confidence=0.5)
 
         self.tracker = None
         self.tracking = False
@@ -160,25 +179,6 @@ class ExamDetector:
             except Exception as e:
                 print(f"Sound initialization failed: {e}")
                 self.enable_sound = False
-
-    # ------- Utility: robust tracker factory (supports different OpenCV builds)
-    def _create_tracker(self):
-        ctor_paths = [
-            "cv2.legacy.TrackerCSRT_create",
-            "cv2.TrackerCSRT_create",
-            "cv2.legacy.TrackerKCF_create",
-            "cv2.TrackerKCF_create",
-        ]
-        for p in ctor_paths:
-            try:
-                parts = p.split('.')
-                obj = cv2
-                for a in parts[1:]:
-                    obj = getattr(obj, a)
-                return obj()
-            except Exception:
-                continue
-        return None
 
     def detect_face_mesh(self, frame):
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -246,22 +246,22 @@ class ExamDetector:
                         'cell phone', 'mobile phone', 'phone', 'smartphone',
                         'iphone', 'android', 'tablet', 'remote'
                     ]
-                    if any(pc in name for pc in phone_classes) and conf >= CONF_THRESHOLD:
+                    if any(phone_class in name for phone_class in phone_classes) and conf >= CONF_THRESHOLD:
                         phone_detected = True
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                        cv2.putText(frame, f'Phone: {conf:.2f}', (x1, y1-10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                        cv2.putText(frame, f'Phone: {conf:.2f}', (x1, y1-10), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
                     paper_classes = [
-                        'book', 'paper', 'notebook', 'magazine',
+                        'book', 'paper', 'notebook', 'magazine', 
                         'newspaper', 'document', 'letter', 'card',
                         'envelope', 'file'
                     ]
-                    if any(pc in name for pc in paper_classes) and conf >= CONF_THRESHOLD:
+                    if any(paper_class in name for paper_class in paper_classes) and conf >= CONF_THRESHOLD:
                         paper_detected = True
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                        cv2.putText(frame, f'Paper: {conf:.2f}', (x1, y1-10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+                        cv2.putText(frame, f'Paper: {conf:.2f}', (x1, y1-10), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
         except Exception as e:
             print(f"YOLO detection error: {e}")
@@ -413,7 +413,9 @@ class ExamDetector:
                 if violation_type == 'absent':
                     self.alert_sound.play()
                 elif violation_type == 'looking_away':
-                    self.alert_sound.play(); time.sleep(0.1); self.alert_sound.play()
+                    self.alert_sound.play()
+                    time.sleep(0.1)
+                    self.alert_sound.play()
                 elif violation_type == 'movement':
                     for i in range(3):
                         self.alert_sound.play()
@@ -433,14 +435,9 @@ class ExamDetector:
         left_right = (None, None)
         looking_forward = True
 
-        # tracker fast path
         if self.tracking and (self.frame_counter % self.detection_interval != 0):
-            try:
-                ok, bbox = self.tracker.update(frame)
-            except Exception:
-                ok = False
-                bbox = None
-            if ok and bbox is not None:
+            ok, bbox = self.tracker.update(frame)
+            if ok:
                 x, y, w, h = map(int, bbox)
                 face_bbox = (x, y, w, h)
                 cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
@@ -448,22 +445,16 @@ class ExamDetector:
                 self.tracking = False
                 self.tracker = None
 
-        # face mesh detection path
         if not self.tracking or (self.frame_counter % self.detection_interval == 0):
             res = self.detect_face_mesh(frame)
             if res[0] is not None:
                 face_bbox, left_right, looking_forward = res
                 x, y, w, h = face_bbox
-                self.tracker = self._create_tracker()
-                if self.tracker is not None:
-                    try:
-                        self.tracker.init(frame, tuple(face_bbox))
-                        self.tracking = True
-                    except Exception:
-                        self.tracking = False
+                self.tracker = cv2.TrackerCSRT_create()
+                self.tracker.init(frame, tuple(face_bbox))
+                self.tracking = True
                 cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-        # objects
         if self.use_yolo:
             phone, paper = self.detect_objects_yolo(annotated)
         else:
@@ -471,7 +462,6 @@ class ExamDetector:
 
         excessive_movement = self.detect_movement(frame)
 
-        # accumulate violations
         if face_bbox is None:
             self.face_lost_counter += 1
             if self.face_lost_counter > self.face_lost_threshold:
@@ -500,15 +490,8 @@ class ExamDetector:
         else:
             self._accumulate_violation('movement', 0)
 
-        self._draw_status(
-            annotated,
-            face_bbox is not None,
-            left_right[0] is not None,
-            looking_forward,
-            phone,
-            paper,
-            excessive_movement,
-        )
+        self._draw_status(annotated, face_bbox is not None, left_right[0] is not None,
+                        looking_forward, phone, paper, excessive_movement)
 
         return annotated
 
@@ -520,22 +503,25 @@ class ExamDetector:
                 'looking_away': 100,
                 'phone': 5,
                 'paper': 3,
-                'movement': 110,
+                'movement': 110
             }
 
         if flag:
-            # phone/paper -> immediate
+            # 🔥 الهاتف والورق يتم تسجيلهما فورًا بدون تراكم
             if vtype in ['phone', 'paper']:
                 self.total_violations += 1
                 t = datetime.now().strftime('%H:%M:%S')
                 self.violations.append({'type': vtype, 'time': t})
                 print(f'Violation: {vtype} at {t}')
                 self._play_alert_sound(vtype)
-                return
+                return  # لا تستمر في التراكم
+
+            # باقي المخالفات (الوجه، الحركة...) تستخدم التراكم
             self._counters[vtype] += 1
         else:
             self._counters[vtype] = max(0, self._counters[vtype] - 2)
 
+        # التحقق من تجاوز العتبة للبقية فقط
         if self._counters[vtype] > self._thresholds[vtype]:
             self._counters[vtype] = 0
             self.total_violations += 1
@@ -552,11 +538,12 @@ class ExamDetector:
         y = 35
         cv2.putText(frame, f'Total Violations: {self.total_violations}', (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
         y += 30
+        
         items = [
-            ('Face', face),
+            ('Face', face), 
             ('Movement Normal', not movement),
             ('Phone Clear', not phone),
-            ('Paper Clear', not paper),
+            ('Paper Clear', not paper)
         ]
         for label, ok in items:
             color = (0,255,0) if ok else (0,0,255)
@@ -564,11 +551,134 @@ class ExamDetector:
             cv2.putText(frame, f'{label}: {txt}', (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             y += 24
 
-# ============================
-# Streamlit UI + WebRTC glue
-# ============================
 
-def save_report(detector: ExamDetector):
+class VideoTransformer(VideoTransformerBase):
+    def __init__(self):
+        self.detector = None
+        self.use_yolo = True
+        self.enable_sound = False  # Disable sound for web version
+        
+    def set_detector(self, detector):
+        self.detector = detector
+        
+    def transform(self, frame):
+        if self.detector is None:
+            return frame.to_ndarray(format="bgr24")
+            
+        img = frame.to_ndarray(format="bgr24")
+        processed = self.detector.process(img)
+        return processed
+
+
+def main():
+    st.markdown('<div class="title">🎓 Exam Monitor</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">AI-powered exam proctoring with face tracking and object detection</div>', unsafe_allow_html=True)
+
+    # Sidebar: Detection Info
+    st.sidebar.header("Detection Info", divider="gray")
+    st.sidebar.markdown("""
+    **Instant Detection:**
+    - 📱 Phone: Immediate alert
+    - 📄 Paper: Immediate alert
+    - 👁️ Face tracking
+    - 🔍 Gaze monitoring
+    - 🚶 Movement analysis
+    """, unsafe_allow_html=True)
+
+    st.sidebar.markdown("---")
+    st.sidebar.header("Settings", divider="gray")
+    use_yolo_checkbox = st.sidebar.checkbox('✅ Use YOLO Detection', value=True, help="Enable YOLO for object detection")
+    enable_sound = st.sidebar.checkbox('🔊 Enable Sound Alerts', value=False, help="Play alert sounds on violations (disabled in web version)")
+
+    # Initialize session state
+    if 'detector' not in st.session_state:
+        st.session_state.detector = None
+    if 'violations' not in st.session_state:
+        st.session_state.violations = []
+    if 'total_violations' not in st.session_state:
+        st.session_state.total_violations = 0
+
+    # Control buttons
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        start = st.button('🟢 Start Monitoring', key='start', help="Start camera and monitoring", type="primary")
+    
+    with col2:
+        stop = st.button('🔴 Stop Monitoring', key='stop', help="Stop camera and monitoring")
+    
+    with col3:
+        save = st.button('💾 Save Report', key='save', help="Save violation report")
+    
+    with col4:
+        reset = st.button('🔄 Reset Violations', key='reset', help="Clear all violations")
+
+    # Create detector if starting
+    if start:
+        try:
+            st.session_state.detector = ExamDetector(use_yolo=use_yolo_checkbox and YOLO_AVAILABLE, enable_sound=False)
+            st.success('✅ Monitoring started successfully')
+        except Exception as e:
+            st.error(f'❌ Failed to start monitoring: {e}')
+
+    # Stop monitoring
+    if stop:
+        st.session_state.detector = None
+        st.success('⏹️ Monitoring stopped')
+
+    # Save report
+    if save and st.session_state.detector:
+        save_report(st.session_state.detector)
+        st.success('✅ Report saved successfully')
+
+    # Reset violations
+    if reset and st.session_state.detector:
+        st.session_state.detector.violations = []
+        st.session_state.detector.total_violations = 0
+        st.success('🔄 Violations reset')
+
+    # WebRTC configuration
+    rtc_configuration = RTCConfiguration({
+        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+    })
+
+    # Create video transformer
+    video_transformer = VideoTransformer()
+    if st.session_state.detector:
+        video_transformer.set_detector(st.session_state.detector)
+
+    # WebRTC streamer
+    webrtc_ctx = webrtc_streamer(
+        key="exam-monitor",
+        video_transformer_factory=lambda: video_transformer,
+        rtc_configuration=rtc_configuration,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
+
+    # Update detector in transformer when it changes
+    if webrtc_ctx.state.playing and st.session_state.detector:
+        video_transformer.set_detector(st.session_state.detector)
+
+    # Display violations
+    st.markdown('### Violations', unsafe_allow_html=True)
+    
+    if st.session_state.detector and st.session_state.detector.violations:
+        viol_text = '<div class="violation-box">' + ''.join([
+            f'<p><strong>#{len(st.session_state.detector.violations)-i}</strong> {v["type"].title()} at {v["time"]}</p>'
+            for i, v in enumerate(reversed(st.session_state.detector.violations))
+        ]) + '</div>'
+    else:
+        viol_text = '<div class="violation-box">No violations yet.</div>'
+    
+    st.markdown(viol_text, unsafe_allow_html=True)
+
+    # Display total violations
+    if st.session_state.detector:
+        st.metric("Total Violations", st.session_state.detector.total_violations)
+
+
+def save_report(detector):
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     fname = f'exam_report_{timestamp}.txt'
     with open(fname, 'w', encoding='utf-8') as f:
@@ -578,98 +688,6 @@ def save_report(detector: ExamDetector):
         for i, v in enumerate(detector.violations, 1):
             f.write(f"{i}. {v['type'].title()} at {v['time']}\n")
     st.toast(f"📄 Report saved: {fname}")
-
-
-def main():
-    st.markdown('<div class="title">🎓 Exam Monitor</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subtitle">AI-powered exam proctoring with face tracking and object detection</div>', unsafe_allow_html=True)
-
-    col1, col2 = st.columns([3, 1], gap="large")
-
-    with col2:
-        st.markdown('### Control Panel', unsafe_allow_html=True)
-        start = st.button('🟢 Start Monitoring', key='start', help="Start camera and monitoring", type="primary")
-        stop = st.button('🔴 Stop Monitoring', key='stop', help="Stop camera and monitoring")
-        save = st.button('💾 Save Report', key='save', help="Save violation report")
-        reset = st.button('🔄 Reset Violations', key='reset', help="Clear all violations")
-        st.markdown('---')
-        st.markdown('### Violations', unsafe_allow_html=True)
-        viol_list = st.empty()
-
-    # Sidebar: Detection Info
-    st.sidebar.header("Detection Info", divider="gray")
-    st.sidebar.markdown(
-        """
-    **Instant Detection:**
-    - 📱 Phone: Immediate alert
-    - 📄 Paper: Immediate alert
-    - 👁️ Face tracking
-    - 🔍 Gaze monitoring
-    - 🚶 Movement analysis
-    """,
-        unsafe_allow_html=True,
-    )
-
-    st.sidebar.markdown("---")
-    st.sidebar.header("Settings", divider="gray")
-    use_yolo_checkbox = st.sidebar.checkbox('✅ Use YOLO Detection', value=True, help="Enable YOLO for object detection")
-    enable_sound = st.sidebar.checkbox('🔊 Enable Sound Alerts (server-side)', value=False, help="Play alert sounds on the server when violations occur")
-
-    # session state
-    if 'monitoring' not in st.session_state:
-        st.session_state.monitoring = False
-        st.session_state.detector = None
-
-    if start and not st.session_state.monitoring:
-        st.session_state.detector = ExamDetector(use_yolo=use_yolo_checkbox and YOLO_AVAILABLE, enable_sound=enable_sound)
-        st.session_state.monitoring = True
-        st.success('✅ Monitoring started successfully')
-
-    if stop and st.session_state.monitoring:
-        st.session_state.monitoring = False
-        st.success('⏹️ Monitoring stopped')
-
-    # WebRTC video callback
-    def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="bgr24")
-        if st.session_state.detector is None:
-            return frame
-        out = st.session_state.detector.process(img)
-        return av.VideoFrame.from_ndarray(out, format="bgr24")
-
-    with col1:
-        if st.session_state.monitoring and st.session_state.detector is not None:
-            webrtc_streamer(
-                key="exam-monitor",
-                mode=WebRtcMode.SENDRECV,
-                video_frame_callback=video_frame_callback,
-                media_stream_constraints={"video": True, "audio": False},
-                rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-                async_processing=True,
-            )
-        else:
-            st.info("Click **Start Monitoring** to begin proctoring.")
-
-    # Update violations panel
-    if st.session_state.detector is not None and st.session_state.detector.violations:
-        viol_text = '<div class="violation-box">' + ''.join([
-            f'<p><strong>#{len(st.session_state.detector.violations)-i}</strong> {v["type"].title()} at {v["time"]}</p>'
-            for i, v in enumerate(reversed(st.session_state.detector.violations))
-        ]) + '</div>'
-    else:
-        viol_text = '<div class="violation-box">No violations yet.</div>'
-    with col2:
-        viol_list.markdown(viol_text, unsafe_allow_html=True)
-
-    # Save & Reset actions
-    if save and st.session_state.detector is not None:
-        save_report(st.session_state.detector)
-        st.success('✅ Report saved successfully')
-
-    if reset and st.session_state.detector is not None:
-        st.session_state.detector.violations = []
-        st.session_state.detector.total_violations = 0
-        st.success('🔄 Violations reset')
 
 
 if __name__ == '__main__':
