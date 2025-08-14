@@ -1,14 +1,12 @@
 import cv2
-import threading
 import time
 import numpy as np
-import queue
 import os
 from datetime import datetime
-import pygame
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
-import av
+from PIL import Image
+import io
+import base64
 
 # Optional: ultralytics YOLO
 try:
@@ -126,24 +124,49 @@ st.markdown("""
         border-color: #ddd;
         margin: 15px 0;
     }
+    .status-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 20px;
+        border-radius: 15px;
+        color: white;
+        text-align: center;
+        margin: 10px 0;
+    }
+    .violation-alert {
+        background-color: #ff4757;
+        color: white;
+        padding: 15px;
+        border-radius: 10px;
+        margin: 10px 0;
+        animation: pulse 1s infinite;
+    }
+    @keyframes pulse {
+        0% { opacity: 1; }
+        50% { opacity: 0.7; }
+        100% { opacity: 1; }
+    }
+    .camera-instructions {
+        background-color: #e3f2fd;
+        padding: 20px;
+        border-radius: 10px;
+        border-left: 5px solid #2196f3;
+        margin: 20px 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
+
 class ExamDetector:
-    def __init__(self, use_yolo=YOLO_AVAILABLE, enable_sound=True):
+    def __init__(self, use_yolo=YOLO_AVAILABLE):
         if not MP_AVAILABLE:
             raise RuntimeError("MediaPipe is required. Install mediapipe package.")
 
         self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(static_image_mode=False,
+        self.face_mesh = self.mp_face_mesh.FaceMesh(static_image_mode=True,
                                                     max_num_faces=1,
                                                     refine_landmarks=True,
                                                     min_detection_confidence=0.5,
                                                     min_tracking_confidence=0.5)
-
-        self.tracker = None
-        self.tracking = False
-        self.track_init_bbox = None
 
         self.prev_gray = None
         self.movement_window = []
@@ -151,6 +174,7 @@ class ExamDetector:
 
         self.violations = []
         self.total_violations = 0
+        self.session_start_time = datetime.now()
 
         self.use_yolo = False
         self.yolo_model = None
@@ -158,43 +182,50 @@ class ExamDetector:
             try:
                 self.yolo_model = YOLO('yolov8n.pt')
                 self.use_yolo = True
-                print('YOLO model loaded: yolov8n.pt')
+                st.success('✅ YOLO model loaded: yolov8n.pt')
             except Exception as e:
-                print('YOLO load failed, falling back to heuristics:', e)
+                st.warning(f'⚠️ YOLO load failed, using basic detection: {e}')
                 self.use_yolo = False
 
-        self.detection_interval = 3
         self.frame_counter = 0
         
-        self.face_lost_counter = 0
-        self.face_lost_threshold = 15
-
-        self.enable_sound = enable_sound
-        if self.enable_sound:
-            try:
-                pygame.mixer.pre_init(frequency=22050, size=-16, channels=2, buffer=1024)
-                pygame.mixer.init()
-                self._generate_alert_sound()
-            except Exception as e:
-                print(f"Sound initialization failed: {e}")
-                self.enable_sound = False
+        # Detection sensitivity settings
+        self.detection_history = {
+            'absent': [],
+            'looking_away': [],
+            'phone': [],
+            'paper': [],
+            'movement': []
+        }
+        
+        self.violation_thresholds = {
+            'phone': 1,  # Immediate detection
+            'paper': 1,  # Immediate detection
+            'absent': 3,  # Need 3 consecutive detections
+            'looking_away': 5,  # Need 5 consecutive detections
+            'movement': 3   # Need 3 consecutive detections
+        }
 
     def detect_face_mesh(self, frame):
+        """Detect face using MediaPipe Face Mesh"""
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(img_rgb)
         h, w = frame.shape[:2]
+        
         if not results.multi_face_landmarks:
             return None, None, None
 
         face_landmarks = results.multi_face_landmarks[0]
         pts = [(int(lm.x * w), int(lm.y * h)) for lm in face_landmarks.landmark]
 
+        # Calculate face bounding box
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         x1, y1 = max(min(xs) - 10, 0), max(min(ys) - 10, 0)
         x2, y2 = min(max(xs) + 10, w - 1), min(max(ys) + 10, h - 1)
         bbox = (x1, y1, x2 - x1, y2 - y1)
 
+        # Eye landmarks for gaze detection
         left_eye_idx = [33, 133, 160, 159, 158, 157, 173]
         right_eye_idx = [263, 362, 387, 386, 385, 384, 398]
 
@@ -209,6 +240,7 @@ class ExamDetector:
         left_center = mean_point(left_eye_idx)
         right_center = mean_point(right_eye_idx)
 
+        # Determine if looking forward
         looking_forward = True
         if left_center and right_center:
             eye_x = (left_center[0] + right_center[0]) / 2
@@ -219,6 +251,7 @@ class ExamDetector:
         return bbox, (left_center, right_center), looking_forward
 
     def detect_objects_yolo(self, frame):
+        """Detect objects using YOLO"""
         phone_detected = False
         paper_detected = False
         CONF_THRESHOLD = 0.3
@@ -263,17 +296,19 @@ class ExamDetector:
                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
         except Exception as e:
-            print(f"YOLO detection error: {e}")
+            st.error(f"YOLO detection error: {e}")
             return self.detect_objects_heuristic(frame)
 
         return phone_detected, paper_detected
 
     def detect_objects_heuristic(self, frame):
+        """Basic object detection using computer vision techniques"""
         phone = self.detect_phone_advanced(frame)
         paper = self.detect_paper_advanced(frame)
         return phone, paper
 
     def detect_phone_advanced(self, frame):
+        """Advanced phone detection using edge detection and contours"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray, 60, 255, cv2.THRESH_BINARY_INV)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -290,6 +325,7 @@ class ExamDetector:
                         if mean_intensity < 100:
                             return True
         
+        # Edge-based detection for rectangular devices
         edges = cv2.Canny(gray, 50, 150, apertureSize=3)
         lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80, minLineLength=50, maxLineGap=10)
         
@@ -312,7 +348,10 @@ class ExamDetector:
         return False
 
     def detect_paper_advanced(self, frame):
+        """Advanced paper detection using color and shape analysis"""
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # White paper detection
         lower_white = np.array([0, 0, 180])
         upper_white = np.array([180, 50, 255])
         
@@ -334,6 +373,7 @@ class ExamDetector:
                     if len(approx) >= 4:
                         return True
         
+        # Cream/off-white paper detection
         lower_cream = np.array([15, 30, 200])
         upper_cream = np.array([35, 80, 255])
         
@@ -346,325 +386,542 @@ class ExamDetector:
         
         return False
 
-    def detect_dark_rectangles(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if 4000 < area < 30000:
-                x, y, w, h = cv2.boundingRect(cnt)
-                ar = w / float(h) if h else 0
-                if 0.3 < ar < 2.5:
-                    return True
-        return False
-
-    def detect_white_areas(self, frame):
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        lower = np.array([0, 0, 200])
-        upper = np.array([180, 60, 255])
-        mask = cv2.inRange(hsv, lower, upper)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            if cv2.contourArea(cnt) > 25000:
-                return True
-        return False
-
     def detect_movement(self, frame):
+        """Detect excessive movement between frames"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if self.prev_gray is None:
             self.prev_gray = gray
             return False
+        
         diff = cv2.absdiff(self.prev_gray, gray)
         _, th = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
         movement = np.sum(th)
         self.prev_gray = gray
+        
         self.movement_window.append(movement)
         if len(self.movement_window) > 20:
             self.movement_window.pop(0)
-        avg_m = np.mean(self.movement_window)
-        return avg_m > self.movement_threshold
+        
+        avg_movement = np.mean(self.movement_window)
+        return avg_movement > self.movement_threshold
 
-    def _generate_alert_sound(self):
-        try:
-            sample_rate = 22050
-            duration = 0.5
-            frequency = 800
-            frames = int(duration * sample_rate)
-            
-            arr = np.sin(2 * np.pi * frequency * np.linspace(0, duration, frames))
-            arr = (arr * 32767).astype(np.int16)
-            arr = np.ascontiguousarray(arr)
-            
-            stereo_arr = np.zeros((frames, 2), dtype=np.int16)
-            stereo_arr[:, 0] = arr
-            stereo_arr[:, 1] = arr
-            stereo_arr = np.ascontiguousarray(stereo_arr)
-            
-            self.alert_sound = pygame.sndarray.make_sound(stereo_arr)
-        except Exception as e:
-            print(f"Alert sound generation failed: {e}")
-            self.enable_sound = False
-
-    def _play_alert_sound(self, violation_type):
-        if self.enable_sound and hasattr(self, 'alert_sound'):
-            try:
-                if violation_type == 'absent':
-                    self.alert_sound.play()
-                elif violation_type == 'looking_away':
-                    self.alert_sound.play()
-                    time.sleep(0.1)
-                    self.alert_sound.play()
-                elif violation_type == 'movement':
-                    for i in range(3):
-                        self.alert_sound.play()
-                        if i < 2:
-                            time.sleep(0.05)
-                else:
-                    self.alert_sound.play()
-            except Exception as e:
-                print(f"Sound play error: {e}")
-                self.enable_sound = False
-
-    def process(self, frame):
+    def process_frame(self, frame):
+        """Process a single frame and return annotated result"""
         self.frame_counter += 1
         annotated = frame.copy()
 
-        face_bbox = None
-        left_right = (None, None)
-        looking_forward = True
+        # Face detection
+        face_result = self.detect_face_mesh(frame)
+        face_bbox = face_result[0] if face_result[0] is not None else None
+        looking_forward = face_result[2] if face_result[0] is not None else False
 
-        if self.tracking and (self.frame_counter % self.detection_interval != 0):
-            ok, bbox = self.tracker.update(frame)
-            if ok:
-                x, y, w, h = map(int, bbox)
-                face_bbox = (x, y, w, h)
-                cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            else:
-                self.tracking = False
-                self.tracker = None
-
-        if not self.tracking or (self.frame_counter % self.detection_interval == 0):
-            res = self.detect_face_mesh(frame)
-            if res[0] is not None:
-                face_bbox, left_right, looking_forward = res
-                x, y, w, h = face_bbox
-                self.tracker = cv2.TrackerCSRT_create()
-                self.tracker.init(frame, tuple(face_bbox))
-                self.tracking = True
-                cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
+        # Object detection
         if self.use_yolo:
             phone, paper = self.detect_objects_yolo(annotated)
         else:
             phone, paper = self.detect_objects_heuristic(annotated)
 
+        # Movement detection
         excessive_movement = self.detect_movement(frame)
 
-        if face_bbox is None:
-            self.face_lost_counter += 1
-            if self.face_lost_counter > self.face_lost_threshold:
-                self._accumulate_violation('absent', 1)
-        else:
-            self.face_lost_counter = 0
-            self._accumulate_violation('absent', 0)
+        # Draw face rectangle if detected
+        if face_bbox is not None:
+            x, y, w, h = face_bbox
+            cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-        if face_bbox is not None and not looking_forward:
-            self._accumulate_violation('looking_away', 1)
-        else:
-            self._accumulate_violation('looking_away', 0)
+        # Process violations with history-based detection
+        self._process_violations({
+            'absent': face_bbox is None,
+            'looking_away': face_bbox is not None and not looking_forward,
+            'phone': phone,
+            'paper': paper,
+            'movement': excessive_movement
+        })
 
-        if phone:
-            self._accumulate_violation('phone', 1)
-        else:
-            self._accumulate_violation('phone', 0)
-
-        if paper:
-            self._accumulate_violation('paper', 1)
-        else:
-            self._accumulate_violation('paper', 0)
-
-        if excessive_movement:
-            self._accumulate_violation('movement', 1)
-        else:
-            self._accumulate_violation('movement', 0)
-
-        self._draw_status(annotated, face_bbox is not None, left_right[0] is not None,
-                        looking_forward, phone, paper, excessive_movement)
+        # Draw status overlay
+        self._draw_status(annotated, {
+            'face': face_bbox is not None,
+            'looking_forward': looking_forward,
+            'phone': phone,
+            'paper': paper,
+            'movement': excessive_movement
+        })
 
         return annotated
 
-    def _accumulate_violation(self, vtype, flag):
-        if not hasattr(self, '_counters'):
-            self._counters = {k: 0 for k in ['absent', 'looking_away', 'phone', 'paper', 'movement']}
-            self._thresholds = {
-                'absent': 50,
-                'looking_away': 100,
-                'phone': 5,
-                'paper': 3,
-                'movement': 110
-            }
-
-        if flag:
-            if vtype in ['phone', 'paper']:
-                self.total_violations += 1
-                t = datetime.now().strftime('%H:%M:%S')
-                self.violations.append({'type': vtype, 'time': t})
-                print(f'Violation: {vtype} at {t}')
-                self._play_alert_sound(vtype)
-                return
-
-            self._counters[vtype] += 1
-        else:
-            self._counters[vtype] = max(0, self._counters[vtype] - 2)
-
-        if self._counters[vtype] > self._thresholds[vtype]:
-            self._counters[vtype] = 0
-            self.total_violations += 1
-            t = datetime.now().strftime('%H:%M:%S')
-            self.violations.append({'type': vtype, 'time': t})
-            print(f'Violation: {vtype} at {t}')
-            self._play_alert_sound(vtype)
-
-    def _draw_status(self, frame, face, eyes, gaze, phone, paper, movement):
-        h, w = frame.shape[:2]
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (420, 140), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-        y = 35
-        cv2.putText(frame, f'Total Violations: {self.total_violations}', (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
-        y += 30
+    def _process_violations(self, detections):
+        """Process violations with history-based filtering"""
+        current_time = datetime.now().strftime('%H:%M:%S')
         
-        items = [
-            ('Face', face), 
-            ('Movement Normal', not movement),
-            ('Phone Clear', not phone),
-            ('Paper Clear', not paper)
+        for violation_type, detected in detections.items():
+            history = self.detection_history[violation_type]
+            threshold = self.violation_thresholds[violation_type]
+            
+            # Add current detection to history
+            history.append(detected)
+            
+            # Keep only recent history (last 10 frames)
+            if len(history) > 10:
+                history.pop(0)
+            
+            # Check if violation threshold is met
+            if len(history) >= threshold and all(history[-threshold:]):
+                # Record violation if not already recorded recently
+                if not self.violations or self.violations[-1]['type'] != violation_type:
+                    self.total_violations += 1
+                    self.violations.append({
+                        'type': violation_type,
+                        'time': current_time,
+                        'frame': self.frame_counter
+                    })
+
+    def _draw_status(self, frame, status):
+        """Draw status overlay on frame"""
+        h, w = frame.shape[:2]
+        
+        # Semi-transparent overlay
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (450, 160), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+        
+        # Status text
+        y = 35
+        cv2.putText(frame, f'Total Violations: {self.total_violations}', 
+                   (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        y += 35
+        
+        status_items = [
+            ('Face Detected', status['face']),
+            ('Looking Forward', status['looking_forward']),
+            ('Phone Clear', not status['phone']),
+            ('Paper Clear', not status['paper']),
+            ('Movement Normal', not status['movement'])
         ]
-        for label, ok in items:
-            color = (0,255,0) if ok else (0,0,255)
-            txt = 'OK' if ok else 'VIOLATION'
-            cv2.putText(frame, f'{label}: {txt}', (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            y += 24
+        
+        for label, is_ok in status_items:
+            color = (0, 255, 0) if is_ok else (0, 0, 255)
+            status_text = 'OK' if is_ok else 'VIOLATION'
+            cv2.putText(frame, f'{label}: {status_text}', 
+                       (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            y += 25
 
-class VideoProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.detector = None
-        self.frame = None
-        self.lock = threading.Lock()
+    def get_violation_summary(self):
+        """Get summary of violations"""
+        violation_counts = {}
+        for v in self.violations:
+            vtype = v['type']
+            violation_counts[vtype] = violation_counts.get(vtype, 0) + 1
+        
+        return {
+            'total': self.total_violations,
+            'by_type': violation_counts,
+            'session_duration': str(datetime.now() - self.session_start_time).split('.')[0],
+            'latest_violations': self.violations[-10:]  # Last 10 violations
+        }
 
-    def set_detector(self, detector):
-        with self.lock:
-            self.detector = detector
-
-    def recv(self, frame):
-        try:
-            img = frame.to_ndarray(format="bgr24")
-            with self.lock:
-                if self.detector is not None:
-                    processed = self.detector.process(img)
-                    return av.VideoFrame.from_ndarray(processed, format="bgr24")
-                return frame
-        except Exception as e:
-            print(f"Error in video processing: {e}")
-            return frame
-
-def save_report(detector):
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    fname = f'exam_report_{timestamp}.txt'
-    with open(fname, 'w', encoding='utf-8') as f:
-        f.write('=== Exam Monitoring Report ===\n')
-        f.write(f'Date: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
-        f.write(f'Total Violations: {detector.total_violations}\n\n')
-        for i, v in enumerate(detector.violations, 1):
-            f.write(f"{i}. {v['type'].title()} at {v['time']}\n")
-    st.toast(f"📄 Report saved: {fname}")
 
 def main():
     st.markdown('<div class="title">🎓 Exam Monitor</div>', unsafe_allow_html=True)
     st.markdown('<div class="subtitle">AI-powered exam proctoring with face tracking and object detection</div>', unsafe_allow_html=True)
 
-    col1, col2 = st.columns([3, 1], gap="large")
+    # Initialize session state
+    if 'detector' not in st.session_state:
+        st.session_state.detector = None
+    if 'monitoring_active' not in st.session_state:
+        st.session_state.monitoring_active = False
 
-    with col1:
-        stframe = st.empty()
-        webrtc_ctx = webrtc_streamer(
-            key="exam-monitor",
-            mode=WebRtcMode.SENDRECV,
-            video_processor_factory=VideoProcessor,
-            media_stream_constraints={"video": True, "audio": False},
-            async_processing=True,
-        )
-
-    with col2:
-        st.markdown('### Control Panel', unsafe_allow_html=True)
-        start = st.button('🟢 Start Monitoring', key='start', help="Start camera and monitoring", type="primary")
-        stop = st.button('🔴 Stop Monitoring', key='stop', help="Stop camera and monitoring")
-        save = st.button('💾 Save Report', key='save', help="Save violation report")
-        reset = st.button('🔄 Reset Violations', key='reset', help="Clear all violations")
-        st.markdown('---')
-        st.markdown('### Violations', unsafe_allow_html=True)
-        viol_list = st.markdown('<div class="violation-box">No violations yet.</div>', unsafe_allow_html=True)
-
-    st.sidebar.header("Detection Info", divider="gray")
-    st.sidebar.markdown("""
-    **Instant Detection:**
-    - 📱 Phone: Immediate alert
-    - 📄 Paper: Immediate alert
-    - 👁️ Face tracking
-    - 🔍 Gaze monitoring
-    - 🚶 Movement analysis
-    """, unsafe_allow_html=True)
+    # Sidebar configuration
+    st.sidebar.header("🔧 Detection Settings", divider="gray")
+    
+    # Check if required packages are available
+    if not MP_AVAILABLE:
+        st.sidebar.error("❌ MediaPipe not available. Please install: pip install mediapipe")
+        return
+    
+    use_yolo = st.sidebar.checkbox('🎯 Use YOLO Detection', 
+                                  value=YOLO_AVAILABLE, 
+                                  disabled=not YOLO_AVAILABLE,
+                                  help="Enable advanced object detection")
+    
+    if not YOLO_AVAILABLE:
+        st.sidebar.info("💡 Install ultralytics for YOLO: pip install ultralytics")
 
     st.sidebar.markdown("---")
-    st.sidebar.header("Settings", divider="gray")
-    use_yolo_checkbox = st.sidebar.checkbox('✅ Use YOLO Detection', value=True, help="Enable YOLO for object detection")
-    enable_sound = st.sidebar.checkbox('🔊 Enable Sound Alerts', value=True, help="Play alert sounds on violations")
+    st.sidebar.markdown("""
+    **🔍 Detection Features:**
+    - 👤 Real-time face tracking
+    - 👁️ Gaze direction monitoring  
+    - 📱 Phone detection (instant alert)
+    - 📄 Paper detection (instant alert)
+    - 🚶 Movement analysis
+    - 📊 Violation logging & reporting
+    """)
 
-    if 'monitoring' not in st.session_state:
-        st.session_state.monitoring = False
-        st.session_state.detector = None
-        st.session_state.webrtc_ctx = None
+    # Main interface
+    col1, col2 = st.columns([2, 1], gap="large")
 
-    if start and not st.session_state.monitoring:
-        if webrtc_ctx.video_processor:
-            st.session_state.detector = ExamDetector(use_yolo=use_yolo_checkbox and YOLO_AVAILABLE, enable_sound=enable_sound)
-            webrtc_ctx.video_processor.set_detector(st.session_state.detector)
-            st.session_state.monitoring = True
-            st.session_state.webrtc_ctx = webrtc_ctx
-            st.success('✅ Monitoring started successfully')
+    with col1:
+        st.markdown("### 📸 Camera Input")
+        
+        # Camera input method selection
+        input_method = st.radio("Choose input method:", 
+                               ["📷 Live Camera", "🖼️ Upload Image", "🎥 Upload Video"], 
+                               horizontal=True)
+        
+        if input_method == "📷 Live Camera":
+            st.markdown('<div class="camera-instructions">📋 <strong>Instructions:</strong><br>1. Click "Take Photo" to capture from your camera<br>2. The system will analyze the image for violations<br>3. Take multiple photos to build a monitoring session</div>', unsafe_allow_html=True)
+            
+            # Camera input
+            camera_image = st.camera_input("📷 Take a photo for monitoring", key="camera")
+            
+            if camera_image is not None:
+                # Convert to OpenCV format
+                image = Image.open(camera_image)
+                frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+                
+                # Initialize detector if not exists
+                if st.session_state.detector is None:
+                    with st.spinner("🔄 Initializing detector..."):
+                        st.session_state.detector = ExamDetector(use_yolo=use_yolo)
+                
+                # Process frame
+                with st.spinner("🔍 Analyzing image..."):
+                    processed_frame = st.session_state.detector.process_frame(frame)
+                
+                # Display processed image
+                st.image(processed_frame, channels='BGR', caption="📊 Analysis Result", use_container_width=True)
 
-    if stop and st.session_state.monitoring:
-        if st.session_state.webrtc_ctx and st.session_state.webrtc_ctx.video_processor:
-            st.session_state.webrtc_ctx.video_processor.set_detector(None)
-        st.session_state.monitoring = False
-        st.session_state.detector = None
-        st.success('⏹️ Monitoring stopped')
+        elif input_method == "🖼️ Upload Image":
+            uploaded_file = st.file_uploader("Choose an image file", 
+                                           type=['png', 'jpg', 'jpeg'],
+                                           help="Upload an image to analyze for violations")
+            
+            if uploaded_file is not None:
+                # Convert to OpenCV format
+                image = Image.open(uploaded_file)
+                frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+                
+                # Initialize detector if not exists
+                if st.session_state.detector is None:
+                    with st.spinner("🔄 Initializing detector..."):
+                        st.session_state.detector = ExamDetector(use_yolo=use_yolo)
+                
+                # Process frame
+                with st.spinner("🔍 Analyzing image..."):
+                    processed_frame = st.session_state.detector.process_frame(frame)
+                
+                # Display results
+                col_img1, col_img2 = st.columns(2)
+                with col_img1:
+                    st.image(image, caption="📁 Original Image", use_container_width=True)
+                with col_img2:
+                    st.image(processed_frame, channels='BGR', caption="📊 Analysis Result", use_container_width=True)
 
-    if st.session_state.monitoring and webrtc_ctx.state.playing:
-        try:
+        else:  # Upload Video
+            st.info("🎥 Video processing: Upload a video file to analyze frame by frame")
+            uploaded_video = st.file_uploader("Choose a video file", 
+                                            type=['mp4', 'avi', 'mov'],
+                                            help="Upload a video to analyze for violations")
+            
+            if uploaded_video is not None:
+                # Save uploaded video temporarily
+                temp_video_path = "temp_video.mp4"
+                with open(temp_video_path, "wb") as f:
+                    f.write(uploaded_video.read())
+                
+                # Initialize detector if not exists
+                if st.session_state.detector is None:
+                    with st.spinner("🔄 Initializing detector..."):
+                        st.session_state.detector = ExamDetector(use_yolo=use_yolo)
+                
+                # Process video
+                process_video_btn = st.button("🎬 Process Video", type="primary")
+                
+                if process_video_btn:
+                    process_uploaded_video(temp_video_path, st.session_state.detector)
+                
+                # Cleanup
+                if os.path.exists(temp_video_path):
+                    os.remove(temp_video_path)
+
+    with col2:
+        st.markdown("### 🎛️ Control Panel")
+        
+        # Control buttons
+        if st.button('🔄 Reset Session', help="Clear all violations and start fresh", type="secondary"):
+            st.session_state.detector = None
+            st.success('✅ Session reset successfully!')
+        
+        if st.button('💾 Download Report', help="Download violation report", type="primary"):
             if st.session_state.detector and st.session_state.detector.violations:
-                viol_text = '<div class="violation-box">' + ''.join([
-                    f'<p><strong>#{len(st.session_state.detector.violations)-i}</strong> {v["type"].title()} at {v["time"]}</p>'
-                    for i, v in enumerate(reversed(st.session_state.detector.violations))
-                ]) + '</div>'
+                report_data = generate_report(st.session_state.detector)
+                st.download_button(
+                    label="📄 Download Report",
+                    data=report_data,
+                    file_name=f"exam_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    mime="text/plain"
+                )
             else:
-                viol_text = '<div class="violation-box">No violations yet.</div>'
-            viol_list.markdown(viol_text, unsafe_allow_html=True)
+                st.warning("⚠️ No violations to report")
 
-            if save:
-                if st.session_state.detector:
-                    save_report(st.session_state.detector)
-                    st.success('✅ Report saved successfully')
+        st.markdown("---")
+        
+        # Violation display
+        st.markdown("### 🚨 Violations Log")
+        
+        if st.session_state.detector and st.session_state.detector.violations:
+            violation_summary = st.session_state.detector.get_violation_summary()
+            
+            # Summary metrics
+            col_metric1, col_metric2 = st.columns(2)
+            with col_metric1:
+                st.metric("Total Violations", violation_summary['total'])
+            with col_metric2:
+                st.metric("Session Time", violation_summary['session_duration'])
+            
+            # Violations by type
+            if violation_summary['by_type']:
+                st.markdown("**📊 Violations by Type:**")
+                for vtype, count in violation_summary['by_type'].items():
+                    st.write(f"• {vtype.replace('_', ' ').title()}: {count}")
+            
+            # Recent violations
+            st.markdown("**🕒 Recent Violations:**")
+            violation_text = '<div class="violation-box">'
+            
+            for i, v in enumerate(reversed(violation_summary['latest_violations']), 1):
+                violation_text += f'<p><strong>#{len(violation_summary["latest_violations"])-i+1}</strong> {v["type"].replace("_", " ").title()} at {v["time"]}</p>'
+            
+            violation_text += '</div>'
+            st.markdown(violation_text, unsafe_allow_html=True)
+            
+        else:
+            st.markdown('<div class="violation-box">No violations detected yet. 🟢</div>', unsafe_allow_html=True)
 
-            if reset:
-                if st.session_state.detector:
-                    st.session_state.detector.violations = []
-                    st.session_state.detector.total_violations = 0
-                    st.success('🔄 Violations reset')
+    # Instructions and info
+    with st.expander("📋 How to Use", expanded=False):
+        st.markdown("""
+        ### 🚀 Getting Started:
+        
+        1. **📷 Choose Input Method**: Select live camera, image upload, or video upload
+        2. **⚙️ Configure Settings**: Enable YOLO detection if available for better accuracy
+        3. **📸 Capture/Upload**: Take photos or upload files for analysis
+        4. **👁️ Monitor Results**: View real-time analysis and violation detection
+        5. **📊 Review Report**: Check violation summary and download detailed reports
+        
+        ### 🎯 What We Detect:
+        
+        - **👤 Face Presence**: Ensures person is visible in frame
+        - **👁️ Gaze Direction**: Monitors if person is looking at screen
+        - **📱 Phone Usage**: Detects mobile phones or similar devices
+        - **📄 Paper Materials**: Identifies unauthorized papers or books
+        - **🚶 Excessive Movement**: Tracks unusual movement patterns
+        
+        ### 🔧 Technical Requirements:
+        
+        - **📦 Required**: MediaPipe (face detection)
+        - **🎯 Optional**: Ultralytics YOLO (enhanced object detection)
+        - **🌐 Browser**: Modern browser with camera access
+        - **📱 Mobile**: Works on mobile devices with cameras
+        """)
 
-        except Exception as e:
-            st.error(f'🚨 Error in monitoring loop: {e}')
+    # Performance metrics
+    if st.session_state.detector:
+        with st.expander("📈 Session Statistics", expanded=False):
+            stats = st.session_state.detector.get_violation_summary()
+            
+            col_stat1, col_stat2, col_stat3 = st.columns(3)
+            
+            with col_stat1:
+                st.metric("Frames Processed", st.session_state.detector.frame_counter)
+            
+            with col_stat2:
+                violation_rate = (stats['total'] / max(st.session_state.detector.frame_counter, 1)) * 100
+                st.metric("Violation Rate", f"{violation_rate:.1f}%")
+            
+            with col_stat3:
+                avg_violations = stats['total'] / max(1, len(stats['session_duration'].split(':')[0]))
+                st.metric("Violations/Hour", f"{avg_violations:.1f}")
+
+
+def process_uploaded_video(video_path, detector):
+    """Process uploaded video file frame by frame"""
+    cap = cv2.VideoCapture(video_path)
+    
+    if not cap.isOpened():
+        st.error("❌ Could not open video file")
+        return
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    duration = total_frames / fps if fps > 0 else 0
+    
+    st.info(f"🎥 Processing video: {total_frames} frames, {duration:.1f}s duration")
+    
+    # Progress tracking
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    frame_placeholder = st.empty()
+    
+    frame_count = 0
+    process_every_n = max(1, fps // 2)  # Process 2 frames per second
+    
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            frame_count += 1
+            
+            # Process every nth frame to improve performance
+            if frame_count % process_every_n == 0:
+                processed_frame = detector.process_frame(frame)
+                
+                # Update display
+                frame_placeholder.image(processed_frame, channels='BGR', 
+                                      caption=f"Frame {frame_count}/{total_frames}", 
+                                      use_container_width=True)
+                
+                # Update progress
+                progress = frame_count / total_frames
+                progress_bar.progress(progress)
+                status_text.text(f"Processing frame {frame_count}/{total_frames} - "
+                               f"Violations detected: {detector.total_violations}")
+            
+            # Add small delay to prevent overwhelming the interface
+            if frame_count % 30 == 0:
+                time.sleep(0.1)
+    
+    except Exception as e:
+        st.error(f"❌ Error processing video: {e}")
+    
+    finally:
+        cap.release()
+        progress_bar.progress(1.0)
+        status_text.text(f"✅ Video processing complete! Total violations: {detector.total_violations}")
+
+
+def generate_report(detector):
+    """Generate a detailed text report"""
+    stats = detector.get_violation_summary()
+    
+    report_lines = [
+        "=" * 50,
+        "📊 EXAM MONITORING REPORT",
+        "=" * 50,
+        f"📅 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"⏱️ Session Duration: {stats['session_duration']}",
+        f"📈 Frames Processed: {detector.frame_counter}",
+        f"🚨 Total Violations: {stats['total']}",
+        "",
+        "📋 VIOLATION BREAKDOWN:",
+        "-" * 30,
+    ]
+    
+    if stats['by_type']:
+        for vtype, count in stats['by_type'].items():
+            percentage = (count / stats['total']) * 100 if stats['total'] > 0 else 0
+            report_lines.append(f"• {vtype.replace('_', ' ').title()}: {count} ({percentage:.1f}%)")
+    else:
+        report_lines.append("• No violations detected")
+    
+    report_lines.extend([
+        "",
+        "🕒 DETAILED VIOLATION LOG:",
+        "-" * 30,
+    ])
+    
+    if detector.violations:
+        for i, violation in enumerate(detector.violations, 1):
+            report_lines.append(
+                f"{i:3d}. [{violation['time']}] "
+                f"{violation['type'].replace('_', ' ').title()} "
+                f"(Frame: {violation.get('frame', 'N/A')})"
+            )
+    else:
+        report_lines.append("• No violations recorded")
+    
+    report_lines.extend([
+        "",
+        "🔍 DETECTION SUMMARY:",
+        "-" * 30,
+        f"• Detection Method: {'YOLO + Heuristic' if detector.use_yolo else 'Heuristic Only'}",
+        f"• Face Detection: MediaPipe Face Mesh",
+        f"• Movement Threshold: {detector.movement_threshold}",
+        "",
+        "📝 RECOMMENDATIONS:",
+        "-" * 30,
+    ])
+    
+    if stats['total'] == 0:
+        report_lines.append("✅ Excellent performance! No violations detected.")
+    elif stats['total'] < 5:
+        report_lines.append("✨ Good performance with minimal violations.")
+    elif stats['total'] < 15:
+        report_lines.append("⚠️ Moderate violations detected. Review behavior.")
+    else:
+        report_lines.append("🚨 High violation count. Requires attention.")
+    
+    report_lines.extend([
+        "",
+        "=" * 50,
+        "📄 End of Report",
+        "=" * 50
+    ])
+    
+    return "\n".join(report_lines)
+
+
+# Additional utility functions
+def create_demo_frame():
+    """Create a demo frame for testing"""
+    frame = np.ones((480, 640, 3), dtype=np.uint8) * 128
+    
+    # Add some demo text
+    cv2.putText(frame, "DEMO MODE", (200, 240), 
+                cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 3)
+    cv2.putText(frame, "Upload an image or use camera", (120, 300), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+    
+    return frame
+
+
+def validate_image_format(uploaded_file):
+    """Validate uploaded image format"""
+    try:
+        image = Image.open(uploaded_file)
+        # Convert to RGB if necessary
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        return image
+    except Exception as e:
+        st.error(f"❌ Invalid image format: {e}")
+        return None
+
+
+# Error handling wrapper
+def safe_process_frame(detector, frame):
+    """Safely process frame with error handling"""
+    try:
+        return detector.process_frame(frame)
+    except Exception as e:
+        st.error(f"❌ Processing error: {e}")
+        # Return original frame with error overlay
+        error_frame = frame.copy()
+        cv2.putText(error_frame, "PROCESSING ERROR", (50, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        return error_frame
+
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as e:
+        st.error(f"🚨 Application Error: {e}")
+        st.info("💡 Try refreshing the page or check your internet connection.")
+        
+        # Display error details in expander for debugging
+        with st.expander("🔧 Technical Details", expanded=False):
+            import traceback
+            st.code(traceback.format_exc(), language='python')
