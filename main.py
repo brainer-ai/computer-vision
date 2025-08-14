@@ -552,27 +552,18 @@ class ExamDetector:
             y += 24
 
 
-# Initialize global detector and state
+# Initialize global detector
 if 'detector' not in st.session_state:
     st.session_state.detector = None
-if 'detector_ready' not in st.session_state:
-    st.session_state.detector_ready = False
 
 def video_frame_callback(frame):
     img = frame.to_ndarray(format="bgr24")
     
-    # Always process frames, even without detector initialized
-    if st.session_state.detector is not None and st.session_state.detector_ready:
-        try:
-            processed_img = st.session_state.detector.process(img)
-            return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
-        except Exception as e:
-            print(f"Detection error: {e}")
-            # Return original frame if processing fails
-            return av.VideoFrame.from_ndarray(img, format="bgr24")
-    else:
-        # Show raw camera feed until detector is ready
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+    if st.session_state.detector is not None:
+        processed_img = st.session_state.detector.process(img)
+        return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
+    
+    return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
 def main():
@@ -583,95 +574,44 @@ def main():
 
     # Sidebar: Settings
     st.sidebar.header("Settings", divider="gray")
-    use_yolo_checkbox = st.sidebar.checkbox('✅ Use YOLO Detection', value=False, help="Enable YOLO for object detection")
+    use_yolo_checkbox = st.sidebar.checkbox('✅ Use YOLO Detection', value=True, help="Enable YOLO for object detection")
     enable_sound = st.sidebar.checkbox('🔊 Enable Sound Alerts', value=True, help="Play alert sounds on violations")
 
-    # Auto-initialize detector on first load
-    if st.session_state.detector is None:
+    # Initialize detector button
+    if st.sidebar.button('🚀 Initialize Detector'):
         try:
-            with st.sidebar:
-                with st.spinner('🚀 Initializing detector...'):
-                    st.session_state.detector = ExamDetector(use_yolo=use_yolo_checkbox and YOLO_AVAILABLE, enable_sound=enable_sound)
-                    st.session_state.detector_ready = True
-                st.success('✅ Detector ready!')
+            st.session_state.detector = ExamDetector(use_yolo=use_yolo_checkbox and YOLO_AVAILABLE, enable_sound=enable_sound)
+            st.sidebar.success('✅ Detector initialized!')
         except Exception as e:
             st.sidebar.error(f'❌ Detector initialization failed: {e}')
-            st.session_state.detector_ready = False
-
-    # Manual re-initialize button
-    if st.sidebar.button('🔄 Reinitialize Detector'):
-        try:
-            with st.sidebar:
-                with st.spinner('🚀 Reinitializing detector...'):
-                    st.session_state.detector = ExamDetector(use_yolo=use_yolo_checkbox and YOLO_AVAILABLE, enable_sound=enable_sound)
-                    st.session_state.detector_ready = True
-                st.success('✅ Detector reinitialized!')
-        except Exception as e:
-            st.sidebar.error(f'❌ Detector initialization failed: {e}')
-            st.session_state.detector_ready = False
 
     with col1:
-        # WebRTC Configuration with better settings
-        RTC_CONFIGURATION = RTCConfiguration({
-            "iceServers": [
-                {"urls": ["stun:stun.l.google.com:19302"]},
-                {"urls": ["stun:stun1.l.google.com:19302"]},
-            ]
-        })
+        # WebRTC Configuration
+        RTC_CONFIGURATION = RTCConfiguration(
+            {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+        )
 
         webrtc_ctx = webrtc_streamer(
-            key="exam-monitor-stream",
+            key="exam-monitor",
             mode=WebRtcMode.SENDRECV,
             rtc_configuration=RTC_CONFIGURATION,
             video_frame_callback=video_frame_callback,
-            media_stream_constraints={
-                "video": {
-                    "width": {"min": 640, "ideal": 1280, "max": 1920},
-                    "height": {"min": 480, "ideal": 720, "max": 1080},
-                    "frameRate": {"ideal": 30, "max": 30}
-                },
-                "audio": False
-            },
+            media_stream_constraints={"video": True, "audio": False},
             async_processing=True,
-            video_html_attrs={
-                "style": {"width": "100%", "margin": "0 auto", "border": "2px solid #c5d9f1", "border-radius": "12px"},
-                "controls": False,
-                "autoplay": True,
-            }
         )
-
-        # Camera status and instructions
-        if webrtc_ctx.state.playing:
-            st.success("🟢 Camera is active and streaming")
-            if not st.session_state.detector_ready:
-                st.warning("⚠️ Detector is still initializing. Raw camera feed shown.")
-        else:
-            st.info("📹 Click START to begin camera streaming, then allow camera permissions when prompted")
-            st.markdown("""
-            **Instructions:**
-            1. Click the **START** button above
-            2. Allow camera permissions when browser prompts
-            3. Wait for the detector to initialize
-            4. Your exam monitoring will begin automatically
-            """)
 
     with col2:
         st.markdown('### Control Panel', unsafe_allow_html=True)
         
-        # Status indicators
+        # Status indicator
         if webrtc_ctx.state.playing:
             st.success('🟢 Camera Active')
         else:
-            st.error('🔴 Camera Inactive')
-        
-        if st.session_state.detector_ready:
-            st.success('🤖 Detector Ready')
-        else:
-            st.warning('⏳ Detector Initializing...')
+            st.info('🔴 Camera Inactive')
         
         # Control buttons
-        save = st.button('💾 Save Report', key='save', help="Save violation report", disabled=not st.session_state.detector_ready)
-        reset = st.button('🔄 Reset Violations', key='reset', help="Clear all violations", disabled=not st.session_state.detector_ready)
+        save = st.button('💾 Save Report', key='save', help="Save violation report")
+        reset = st.button('🔄 Reset Violations', key='reset', help="Clear all violations")
         
         st.markdown('---')
         st.markdown('### Violations', unsafe_allow_html=True)
@@ -690,17 +630,8 @@ def main():
     # Sidebar: Detection Info
     st.sidebar.markdown("---")
     st.sidebar.header("Detection Info", divider="gray")
-    
-    # Show detector status
-    if st.session_state.detector_ready:
-        st.sidebar.success("🟢 Detector Active")
-        detection_mode = "YOLO + Heuristics" if (st.session_state.detector and st.session_state.detector.use_yolo) else "Heuristics Only"
-        st.sidebar.info(f"Mode: {detection_mode}")
-    else:
-        st.sidebar.warning("🟡 Detector Initializing...")
-    
     st.sidebar.markdown("""
-    **Detection Features:**
+    **Instant Detection:**
     - 📱 Phone: Immediate alert
     - 📄 Paper: Immediate alert
     - 👁️ Face tracking
@@ -709,11 +640,11 @@ def main():
     """, unsafe_allow_html=True)
 
     # Button actions
-    if save and st.session_state.detector and st.session_state.detector_ready:
+    if save and st.session_state.detector:
         save_report(st.session_state.detector)
         st.success('✅ Report saved successfully')
 
-    if reset and st.session_state.detector and st.session_state.detector_ready:
+    if reset and st.session_state.detector:
         st.session_state.detector.violations = []
         st.session_state.detector.total_violations = 0
         st.success('🔄 Violations reset')
