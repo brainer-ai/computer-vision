@@ -25,6 +25,14 @@ except Exception as e:
     print(f"MediaPipe not available: {e}")
     MP_AVAILABLE = False
 
+# Fallback: OpenCV face detection
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except Exception as e:
+    print(f"OpenCV not available: {e}")
+    CV2_AVAILABLE = False
+
 # Streamlit page config
 st.set_page_config(
     page_title="Exam Monitor",
@@ -133,15 +141,27 @@ st.markdown("""
 
 class ExamDetector:
     def __init__(self, use_yolo=YOLO_AVAILABLE, enable_sound=True):
-        if not MP_AVAILABLE:
-            raise RuntimeError("MediaPipe is required. Install mediapipe package.")
+        if not MP_AVAILABLE and not CV2_AVAILABLE:
+            raise RuntimeError("Neither MediaPipe nor OpenCV is available. Install mediapipe or opencv-python package.")
+        
+        self.use_mediapipe = MP_AVAILABLE
+        self.use_opencv_fallback = not MP_AVAILABLE and CV2_AVAILABLE
 
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(static_image_mode=False,
-                                                    max_num_faces=1,
-                                                    refine_landmarks=True,
-                                                    min_detection_confidence=0.5,
-                                                    min_tracking_confidence=0.5)
+        if self.use_mediapipe:
+            try:
+                self.mp_face_mesh = mp.solutions.face_mesh
+                self.face_mesh = self.mp_face_mesh.FaceMesh(static_image_mode=False,
+                                                            max_num_faces=1,
+                                                            refine_landmarks=True,
+                                                            min_detection_confidence=0.5,
+                                                            min_tracking_confidence=0.5)
+            except Exception as e:
+                raise RuntimeError(f"Failed to initialize MediaPipe: {e}")
+        elif self.use_opencv_fallback:
+            try:
+                self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            except Exception as e:
+                raise RuntimeError(f"Failed to initialize OpenCV face detection: {e}")
 
         self.tracker = None
         self.tracking = False
@@ -182,6 +202,14 @@ class ExamDetector:
                 self.enable_sound = False
 
     def detect_face_mesh(self, frame):
+        if self.use_mediapipe:
+            return self._detect_face_mediapipe(frame)
+        elif self.use_opencv_fallback:
+            return self._detect_face_opencv(frame)
+        else:
+            return None, None, None
+    
+    def _detect_face_mediapipe(self, frame):
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(img_rgb)
         h, w = frame.shape[:2]
@@ -218,6 +246,27 @@ class ExamDetector:
             deviation = abs(eye_x - face_center_x)
             looking_forward = deviation < (bbox[2] * 0.25)
 
+        return bbox, (left_center, right_center), looking_forward
+    
+    def _detect_face_opencv(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(gray, 1.1, 4)
+        
+        if len(faces) == 0:
+            return None, None, None
+        
+        # Use the largest face
+        largest_face = max(faces, key=lambda x: x[2] * x[3])
+        x, y, w, h = largest_face
+        bbox = (x, y, w, h)
+        
+        # Simple eye center estimation for OpenCV fallback
+        left_center = (x + w//4, y + h//3)
+        right_center = (x + 3*w//4, y + h//3)
+        
+        # Always assume looking forward for OpenCV fallback
+        looking_forward = True
+        
         return bbox, (left_center, right_center), looking_forward
 
     def detect_objects_yolo(self, frame):
@@ -564,10 +613,20 @@ class VideoTransformer(VideoTransformerBase):
         
     def transform(self, frame):
         try:
-            if self.detector is None:
-                return frame.to_ndarray(format="bgr24")
-                
             img = frame.to_ndarray(format="bgr24")
+            
+            if self.detector is None:
+                # Add a simple overlay when no detector is active
+                h, w = img.shape[:2]
+                overlay = img.copy()
+                cv2.rectangle(overlay, (10, 10), (300, 80), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.7, img, 0.3, 0, img)
+                cv2.putText(img, 'Camera Active - Click Start to Monitor', (20, 35), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.putText(img, 'Waiting for AI models...', (20, 60), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                return img
+                
             processed = self.detector.process(img)
             return processed
         except Exception as e:
@@ -594,13 +653,26 @@ def main():
     st.sidebar.header("Settings", divider="gray")
     use_yolo_checkbox = st.sidebar.checkbox('✅ Use YOLO Detection', value=True, help="Enable YOLO for object detection")
     enable_sound = st.sidebar.checkbox('🔊 Enable Sound Alerts', value=False, help="Play alert sounds on violations (disabled in web version)")
+    
+    # Show detection method status
+    st.sidebar.markdown("---")
+    st.sidebar.header("Status", divider="gray")
+    if st.session_state.detector:
+        if st.session_state.detector.use_mediapipe:
+            st.sidebar.success("🎯 Using MediaPipe")
+        elif st.session_state.detector.use_opencv_fallback:
+            st.sidebar.warning("🎯 Using OpenCV Fallback")
+        else:
+            st.sidebar.info("🎯 Detection method unknown")
+    else:
+        st.sidebar.info("⏸️ Monitoring not started")
 
     # Initialize session state
-    if 'detector' not in st.session_state:
+    if not hasattr(st.session_state, 'detector'):
         st.session_state.detector = None
-    if 'violations' not in st.session_state:
+    if not hasattr(st.session_state, 'violations'):
         st.session_state.violations = []
-    if 'total_violations' not in st.session_state:
+    if not hasattr(st.session_state, 'total_violations'):
         st.session_state.total_violations = 0
 
     # Control buttons
@@ -622,8 +694,17 @@ def main():
     if start:
         try:
             with st.spinner('Initializing AI models... This may take a moment.'):
-                st.session_state.detector = ExamDetector(use_yolo=use_yolo_checkbox and YOLO_AVAILABLE, enable_sound=False)
-            st.success('✅ Monitoring started successfully')
+                detector = ExamDetector(use_yolo=use_yolo_checkbox and YOLO_AVAILABLE, enable_sound=False)
+                st.session_state.detector = detector
+                
+                # Show which detection method is being used
+                if detector.use_mediapipe:
+                    st.success('✅ Monitoring started successfully (MediaPipe)')
+                elif detector.use_opencv_fallback:
+                    st.success('✅ Monitoring started successfully (OpenCV Fallback)')
+                else:
+                    st.success('✅ Monitoring started successfully')
+                    
         except Exception as e:
             st.error(f'❌ Failed to start monitoring: {str(e)}')
             st.info('💡 Try refreshing the page and starting again.')
@@ -652,8 +733,11 @@ def main():
     # WebRTC streamer with proper factory function
     def create_video_transformer():
         transformer = VideoTransformer()
-        if st.session_state.detector:
-            transformer.set_detector(st.session_state.detector)
+        try:
+            if hasattr(st.session_state, 'detector') and st.session_state.detector is not None:
+                transformer.set_detector(st.session_state.detector)
+        except Exception as e:
+            print(f"Error setting detector: {e}")
         return transformer
 
     webrtc_ctx = webrtc_streamer(
