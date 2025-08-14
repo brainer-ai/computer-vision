@@ -21,7 +21,8 @@ except Exception:
 try:
     import mediapipe as mp
     MP_AVAILABLE = True
-except Exception:
+except Exception as e:
+    print(f"MediaPipe not available: {e}")
     MP_AVAILABLE = False
 
 # Streamlit page config
@@ -562,12 +563,16 @@ class VideoTransformer(VideoTransformerBase):
         self.detector = detector
         
     def transform(self, frame):
-        if self.detector is None:
+        try:
+            if self.detector is None:
+                return frame.to_ndarray(format="bgr24")
+                
+            img = frame.to_ndarray(format="bgr24")
+            processed = self.detector.process(img)
+            return processed
+        except Exception as e:
+            # Return original frame if processing fails
             return frame.to_ndarray(format="bgr24")
-            
-        img = frame.to_ndarray(format="bgr24")
-        processed = self.detector.process(img)
-        return processed
 
 
 def main():
@@ -616,10 +621,12 @@ def main():
     # Create detector if starting
     if start:
         try:
-            st.session_state.detector = ExamDetector(use_yolo=use_yolo_checkbox and YOLO_AVAILABLE, enable_sound=False)
+            with st.spinner('Initializing AI models... This may take a moment.'):
+                st.session_state.detector = ExamDetector(use_yolo=use_yolo_checkbox and YOLO_AVAILABLE, enable_sound=False)
             st.success('✅ Monitoring started successfully')
         except Exception as e:
-            st.error(f'❌ Failed to start monitoring: {e}')
+            st.error(f'❌ Failed to start monitoring: {str(e)}')
+            st.info('💡 Try refreshing the page and starting again.')
 
     # Stop monitoring
     if stop:
@@ -642,23 +649,20 @@ def main():
         "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
     })
 
-    # Create video transformer
-    video_transformer = VideoTransformer()
-    if st.session_state.detector:
-        video_transformer.set_detector(st.session_state.detector)
+    # WebRTC streamer with proper factory function
+    def create_video_transformer():
+        transformer = VideoTransformer()
+        if st.session_state.detector:
+            transformer.set_detector(st.session_state.detector)
+        return transformer
 
-    # WebRTC streamer
     webrtc_ctx = webrtc_streamer(
         key="exam-monitor",
-        video_transformer_factory=lambda: video_transformer,
+        video_transformer_factory=create_video_transformer,
         rtc_configuration=rtc_configuration,
         media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
     )
-
-    # Update detector in transformer when it changes
-    if webrtc_ctx.state.playing and st.session_state.detector:
-        video_transformer.set_detector(st.session_state.detector)
 
     # Display violations
     st.markdown('### Violations', unsafe_allow_html=True)
