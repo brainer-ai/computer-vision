@@ -1,28 +1,27 @@
 import cv2
-import threading
-import time
 import numpy as np
-import queue
-import os
-from datetime import datetime
-import pygame
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration, VideoProcessorBase
 import av
+import time
+from datetime import datetime
+import os
 
 # Optional: ultralytics YOLO
 try:
     from ultralytics import YOLO
     YOLO_AVAILABLE = True
-except Exception:
+except Exception as e:
     YOLO_AVAILABLE = False
+    print(f"YOLO not available: {e}")
 
 # MediaPipe for face mesh
 try:
     import mediapipe as mp
     MP_AVAILABLE = True
-except Exception:
+except Exception as e:
     MP_AVAILABLE = False
+    print(f"MediaPipe not available: {e}")
 
 # Streamlit page config
 st.set_page_config(
@@ -126,6 +125,15 @@ st.markdown("""
         border-color: #ddd;
         margin: 15px 0;
     }
+    .stats-box {
+        background-color: #fff;
+        padding: 12px;
+        border-radius: 8px;
+        border-left: 4px solid #007bff;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+        margin-bottom: 12px;
+        font-size: 14px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -136,11 +144,13 @@ class ExamDetector:
             raise RuntimeError("MediaPipe is required. Install mediapipe package.")
 
         self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(static_image_mode=False,
-                                                    max_num_faces=1,
-                                                    refine_landmarks=True,
-                                                    min_detection_confidence=0.5,
-                                                    min_tracking_confidence=0.5)
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
 
         self.tracker = None
         self.tracking = False
@@ -157,28 +167,22 @@ class ExamDetector:
         self.yolo_model = None
         if use_yolo:
             try:
-                self.yolo_model = YOLO('yolov8n.pt')
+                self.yolo_model = YOLO('yolov8n.pt')  # Auto-downloads if not present
                 self.use_yolo = True
-                print('YOLO model loaded: yolov8n.pt')
+                print('✅ YOLO model loaded: yolov8n.pt')
             except Exception as e:
-                print('YOLO load failed, falling back to heuristics:', e)
+                print('❌ YOLO load failed:', e)
                 self.use_yolo = False
 
         self.detection_interval = 3
         self.frame_counter = 0
-        
+        self.fps_counter = 0
+        self.fps_start_time = time.time()
+
         self.face_lost_counter = 0
         self.face_lost_threshold = 15
 
         self.enable_sound = enable_sound
-        if self.enable_sound:
-            try:
-                pygame.mixer.pre_init(frequency=22050, size=-16, channels=2, buffer=1024)
-                pygame.mixer.init()
-                self._generate_alert_sound()
-            except Exception as e:
-                print(f"Sound initialization failed: {e}")
-                self.enable_sound = False
 
     def detect_face_mesh(self, frame):
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -227,7 +231,7 @@ class ExamDetector:
         MAX_AREA = 100000
 
         try:
-            results = self.yolo_model(frame, conf=CONF_THRESHOLD, verbose=False, imgsz=640)
+            results = self.yolo_model(frame, conf=CONF_THRESHOLD, verbose=False, imgsz=320)
             names = self.yolo_model.names
 
             for r in results:
@@ -347,30 +351,6 @@ class ExamDetector:
         
         return False
 
-    def detect_dark_rectangles(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if 4000 < area < 30000:
-                x, y, w, h = cv2.boundingRect(cnt)
-                ar = w / float(h) if h else 0
-                if 0.3 < ar < 2.5:
-                    return True
-        return False
-
-    def detect_white_areas(self, frame):
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        lower = np.array([0, 0, 200])
-        upper = np.array([180, 60, 255])
-        mask = cv2.inRange(hsv, lower, upper)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            if cv2.contourArea(cnt) > 25000:
-                return True
-        return False
-
     def detect_movement(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if self.prev_gray is None:
@@ -386,81 +366,72 @@ class ExamDetector:
         avg_m = np.mean(self.movement_window)
         return avg_m > self.movement_threshold
 
-    def _generate_alert_sound(self):
-        try:
-            sample_rate = 22050
-            duration = 0.5
-            frequency = 800
-            frames = int(duration * sample_rate)
-            
-            arr = np.sin(2 * np.pi * frequency * np.linspace(0, duration, frames))
-            arr = (arr * 32767).astype(np.int16)
-            arr = np.ascontiguousarray(arr)
-            
-            stereo_arr = np.zeros((frames, 2), dtype=np.int16)
-            stereo_arr[:, 0] = arr
-            stereo_arr[:, 1] = arr
-            stereo_arr = np.ascontiguousarray(stereo_arr)
-            
-            self.alert_sound = pygame.sndarray.make_sound(stereo_arr)
-        except Exception as e:
-            print(f"Alert sound generation failed: {e}")
-            self.enable_sound = False
+    def _play_browser_alert(self, violation_type):
+        if self.enable_sound:
+            # Inject HTML/JS to play sound in browser
+            sound_url = {
+                'phone': 'https://www.soundjay.com/misc/sounds/cell-phone-ring-1.mp3',
+                'paper': 'https://www.soundjay.com/buttons/sounds/button-1.mp3',
+                'absent': 'https://www.soundjay.com/misc/sounds/bell-ringing-05.mp3',
+                'looking_away': 'https://www.soundjay.com/human/sounds/scream-1.mp3',
+                'movement': 'https://www.soundjay.com/buttons/sounds/button-2.mp3'
+            }.get(violation_type, 'https://www.soundjay.com/misc/sounds/bell-ringing-05.mp3')
 
-    def _play_alert_sound(self, violation_type):
-        if self.enable_sound and hasattr(self, 'alert_sound'):
-            try:
-                if violation_type == 'absent':
-                    self.alert_sound.play()
-                elif violation_type == 'looking_away':
-                    self.alert_sound.play()
-                    time.sleep(0.1)
-                    self.alert_sound.play()
-                elif violation_type == 'movement':
-                    for i in range(3):
-                        self.alert_sound.play()
-                        if i < 2:
-                            time.sleep(0.05)
-                else:
-                    self.alert_sound.play()
-            except Exception as e:
-                print(f"Sound play error: {e}")
-                self.enable_sound = False
+            st.markdown(f"""
+            <script>
+                const audio = new Audio('{sound_url}');
+                audio.play().catch(e => console.log('Audio play prevented:', e));
+            </script>
+            """, unsafe_allow_html=True)
 
     def process(self, frame):
         self.frame_counter += 1
+        self.fps_counter += 1
         annotated = frame.copy()
+
+        # Resize for faster processing
+        small_frame = cv2.resize(annotated, (640, 480))
+        h, w = small_frame.shape[:2]
 
         face_bbox = None
         left_right = (None, None)
         looking_forward = True
 
+        # Update FPS every second
+        current_time = time.time()
+        if current_time - self.fps_start_time >= 1.0:
+            self.fps = self.fps_counter / (current_time - self.fps_start_time)
+            self.fps_counter = 0
+            self.fps_start_time = current_time
+        else:
+            self.fps = getattr(self, 'fps', 0)
+
         if self.tracking and (self.frame_counter % self.detection_interval != 0):
-            ok, bbox = self.tracker.update(frame)
+            ok, bbox = self.tracker.update(small_frame)
             if ok:
                 x, y, w, h = map(int, bbox)
                 face_bbox = (x, y, w, h)
-                cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.rectangle(small_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             else:
                 self.tracking = False
                 self.tracker = None
 
         if not self.tracking or (self.frame_counter % self.detection_interval == 0):
-            res = self.detect_face_mesh(frame)
+            res = self.detect_face_mesh(small_frame)
             if res[0] is not None:
                 face_bbox, left_right, looking_forward = res
                 x, y, w, h = face_bbox
                 self.tracker = cv2.TrackerCSRT_create()
-                self.tracker.init(frame, tuple(face_bbox))
+                self.tracker.init(small_frame, tuple(face_bbox))
                 self.tracking = True
-                cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.rectangle(small_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
         if self.use_yolo:
-            phone, paper = self.detect_objects_yolo(annotated)
+            phone, paper = self.detect_objects_yolo(small_frame)
         else:
-            phone, paper = self.detect_objects_heuristic(annotated)
+            phone, paper = self.detect_objects_heuristic(small_frame)
 
-        excessive_movement = self.detect_movement(frame)
+        excessive_movement = self.detect_movement(small_frame)
 
         if face_bbox is None:
             self.face_lost_counter += 1
@@ -490,10 +461,12 @@ class ExamDetector:
         else:
             self._accumulate_violation('movement', 0)
 
-        self._draw_status(annotated, face_bbox is not None, left_right[0] is not None,
+        self._draw_status(small_frame, face_bbox is not None, left_right[0] is not None,
                         looking_forward, phone, paper, excessive_movement)
 
-        return annotated
+        # Resize back to original if needed
+        result = cv2.resize(small_frame, (frame.shape[1], frame.shape[0]))
+        return result
 
     def _accumulate_violation(self, vtype, flag):
         if not hasattr(self, '_counters'):
@@ -507,61 +480,63 @@ class ExamDetector:
             }
 
         if flag:
-            # 🔥 الهاتف والورق يتم تسجيلهما فورًا بدون تراكم
             if vtype in ['phone', 'paper']:
                 self.total_violations += 1
                 t = datetime.now().strftime('%H:%M:%S')
                 self.violations.append({'type': vtype, 'time': t})
-                print(f'Violation: {vtype} at {t}')
-                self._play_alert_sound(vtype)
-                return  # لا تستمر في التراكم
+                print(f'🚨 Violation: {vtype} at {t}')
+                self._play_browser_alert(vtype)
+                return
 
-            # باقي المخالفات (الوجه، الحركة...) تستخدم التراكم
             self._counters[vtype] += 1
         else:
             self._counters[vtype] = max(0, self._counters[vtype] - 2)
 
-        # التحقق من تجاوز العتبة للبقية فقط
         if self._counters[vtype] > self._thresholds[vtype]:
             self._counters[vtype] = 0
             self.total_violations += 1
             t = datetime.now().strftime('%H:%M:%S')
             self.violations.append({'type': vtype, 'time': t})
-            print(f'Violation: {vtype} at {t}')
-            self._play_alert_sound(vtype)
+            print(f'🚨 Violation: {vtype} at {t}')
+            self._play_browser_alert(vtype)
 
     def _draw_status(self, frame, face, eyes, gaze, phone, paper, movement):
-        h, w = frame.shape[:2]
         overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (420, 140), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (10, 10), (420, 180), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
         y = 35
         cv2.putText(frame, f'Total Violations: {self.total_violations}', (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
         y += 30
-        
+        cv2.putText(frame, f'FPS: {getattr(self, "fps", 0):.1f}', (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        y += 24
+
         items = [
             ('Face', face), 
-            ('Movement Normal', not movement),
+            ('Move Normal', not movement),
             ('Phone Clear', not phone),
             ('Paper Clear', not paper)
         ]
         for label, ok in items:
             color = (0,255,0) if ok else (0,0,255)
-            txt = 'OK' if ok else 'VIOLATION'
+            txt = 'OK' if ok else 'ALERT'
             cv2.putText(frame, f'{label}: {txt}', (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             y += 24
 
 
-# Initialize global detector
+# Initialize session state
 if 'detector' not in st.session_state:
     st.session_state.detector = None
 
 def video_frame_callback(frame):
     img = frame.to_ndarray(format="bgr24")
-    
+
     if st.session_state.detector is not None:
-        processed_img = st.session_state.detector.process(img)
-        return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
+        try:
+            processed = st.session_state.detector.process(img)
+            return av.VideoFrame.from_ndarray(processed, format="bgr24")
+        except Exception as e:
+            print("Frame processing error:", e)
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
     
     return av.VideoFrame.from_ndarray(img, format="bgr24")
 
@@ -577,16 +552,14 @@ def main():
     use_yolo_checkbox = st.sidebar.checkbox('✅ Use YOLO Detection', value=True, help="Enable YOLO for object detection")
     enable_sound = st.sidebar.checkbox('🔊 Enable Sound Alerts', value=True, help="Play alert sounds on violations")
 
-    # Initialize detector button
     if st.sidebar.button('🚀 Initialize Detector'):
         try:
             st.session_state.detector = ExamDetector(use_yolo=use_yolo_checkbox and YOLO_AVAILABLE, enable_sound=enable_sound)
             st.sidebar.success('✅ Detector initialized!')
         except Exception as e:
-            st.sidebar.error(f'❌ Detector initialization failed: {e}')
+            st.sidebar.error(f'❌ Failed: {e}')
 
     with col1:
-        # WebRTC Configuration
         RTC_CONFIGURATION = RTCConfiguration(
             {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
         )
@@ -596,58 +569,60 @@ def main():
             mode=WebRtcMode.SENDRECV,
             rtc_configuration=RTC_CONFIGURATION,
             video_frame_callback=video_frame_callback,
-            media_stream_constraints={"video": True, "audio": False},
+            media_stream_constraints={
+                "video": {"width": 640, "height": 480},
+                "audio": False
+            },
             async_processing=True,
+            skip_audio=True,
         )
 
     with col2:
         st.markdown('### Control Panel', unsafe_allow_html=True)
         
-        # Status indicator
         if webrtc_ctx.state.playing:
             st.success('🟢 Camera Active')
         else:
             st.info('🔴 Camera Inactive')
         
-        # Control buttons
-        save = st.button('💾 Save Report', key='save', help="Save violation report")
-        reset = st.button('🔄 Reset Violations', key='reset', help="Clear all violations")
+        save = st.button('💾 Save Report', key='save')
+        reset = st.button('🔄 Reset Violations', key='reset')
         
         st.markdown('---')
-        st.markdown('### Violations', unsafe_allow_html=True)
+        st.markdown('### 📊 Stats', unsafe_allow_html=True)
         
-        # Display violations
+        if st.session_state.detector:
+            fps = getattr(st.session_state.detector, 'fps', 0)
+            st.markdown(f'<div class="stats-box">FPS: {fps:.1f}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="stats-box">Total Violations: {st.session_state.detector.total_violations}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="stats-box">FPS: 0</div>', unsafe_allow_html=True)
+            st.markdown('<div class="stats-box">Violations: 0</div>', unsafe_allow_html=True)
+
+        st.markdown('### ⚠️ Violations', unsafe_allow_html=True)
         if st.session_state.detector and st.session_state.detector.violations:
             viol_text = '<div class="violation-box">' + ''.join([
                 f'<p><strong>#{len(st.session_state.detector.violations)-i}</strong> {v["type"].title()} at {v["time"]}</p>'
-                for i, v in enumerate(reversed(st.session_state.detector.violations))
+                for i, v in enumerate(reversed(st.session_state.detector.violations[-10:]))  # Show last 10
             ]) + '</div>'
         else:
             viol_text = '<div class="violation-box">No violations yet.</div>'
         
         st.markdown(viol_text, unsafe_allow_html=True)
 
-    # Sidebar: Detection Info
+    # Sidebar: Info
     st.sidebar.markdown("---")
-    st.sidebar.header("Detection Info", divider="gray")
-    st.sidebar.markdown("""
-    **Instant Detection:**
-    - 📱 Phone: Immediate alert
-    - 📄 Paper: Immediate alert
-    - 👁️ Face tracking
-    - 🔍 Gaze monitoring
-    - 🚶 Movement analysis
-    """, unsafe_allow_html=True)
+    st.sidebar.markdown("### 📌 Notes")
+    st.sidebar.info("Click 'Initialize Detector' to start AI analysis.")
 
-    # Button actions
     if save and st.session_state.detector:
         save_report(st.session_state.detector)
-        st.success('✅ Report saved successfully')
+        st.toast('📄 Report saved!')
 
     if reset and st.session_state.detector:
         st.session_state.detector.violations = []
         st.session_state.detector.total_violations = 0
-        st.success('🔄 Violations reset')
+        st.toast('🔄 Violations reset')
 
 
 def save_report(detector):
