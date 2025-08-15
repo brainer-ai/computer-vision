@@ -5,7 +5,6 @@ from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 import av
 from datetime import datetime
 import threading
-import queue
 import time
 import logging
 
@@ -83,12 +82,6 @@ st.markdown("""
         margin: 8px 0;
         color: #00ff88;
     }
-    .webrtc-container {
-        border: 2px solid #c5d9f1;
-        border-radius: 12px;
-        padding: 10px;
-        margin: 10px 0;
-    }
     .connection-status {
         padding: 10px;
         border-radius: 5px;
@@ -116,17 +109,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Enhanced WebRTC configuration with multiple STUN/TURN servers
+# Enhanced WebRTC configuration
 RTC_CONFIGURATION = RTCConfiguration({
     "iceServers": [
-        # Google STUN servers
         {"urls": ["stun:stun.l.google.com:19302"]},
         {"urls": ["stun:stun1.l.google.com:19302"]},
         {"urls": ["stun:stun2.l.google.com:19302"]},
-        
-        # Additional public STUN servers
         {"urls": ["stun:stun.stunprotocol.org:3478"]},
-        {"urls": ["stun:stun.voiparound.com"]},
     ],
     "iceCandidatePoolSize": 10
 })
@@ -145,14 +134,21 @@ class ExamDetector:
             min_tracking_confidence=0.5
         )
 
+        # Tracking
+        self.tracker = None
+        self.tracking = False
+        
+        # Movement detection
         self.prev_gray = None
         self.movement_window = []
-        self.movement_threshold = 50000
+        self.movement_threshold = 80000
 
+        # Violations
         self.violations = []
         self.total_violations = 0
         self.violations_lock = threading.Lock()
 
+        # YOLO setup
         self.use_yolo = False
         self.yolo_model = None
         if use_yolo and YOLO_AVAILABLE:
@@ -164,13 +160,29 @@ class ExamDetector:
                 print(f'YOLO load failed: {e}')
                 self.use_yolo = False
 
+        # Frame processing
         self.frame_counter = 0
-        self.detection_interval = 5  # Process every 5th frame for performance
+        self.detection_interval = 3
         self.last_process_time = time.time()
-        self.initialized = True  # Mark as initialized
+        
+        # Face tracking
+        self.face_lost_counter = 0
+        self.face_lost_threshold = 15
+
+        # Violation accumulation (like in working code)
+        self._counters = {k: 0 for k in ['absent', 'looking_away', 'phone', 'paper', 'movement']}
+        self._thresholds = {
+            'absent': 50,
+            'looking_away': 100,
+            'phone': 5,
+            'paper': 3,
+            'movement': 110
+        }
+
+        print("✅ ExamDetector initialized successfully")
 
     def detect_face_mesh(self, frame):
-        """Detect face using MediaPipe Face Mesh with error handling"""
+        """Detect face using MediaPipe Face Mesh"""
         try:
             img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.face_mesh.process(img_rgb)
@@ -210,7 +222,7 @@ class ExamDetector:
                 eye_x = (left_center[0] + right_center[0]) / 2
                 face_center_x = (x1 + x2) / 2
                 deviation = abs(eye_x - face_center_x)
-                looking_forward = deviation < (bbox[2] * 0.3)
+                looking_forward = deviation < (bbox[2] * 0.25)
 
             return bbox, (left_center, right_center), looking_forward
             
@@ -219,7 +231,7 @@ class ExamDetector:
             return None, None, False
 
     def detect_objects_yolo(self, frame):
-        """Detect objects using YOLO with error handling"""
+        """Detect objects using YOLO"""
         phone_detected = False
         paper_detected = False
         
@@ -227,7 +239,7 @@ class ExamDetector:
             return phone_detected, paper_detected
 
         try:
-            results = self.yolo_model(frame, conf=0.4, verbose=False, imgsz=416)
+            results = self.yolo_model(frame, conf=0.3, verbose=False, imgsz=640)
             names = self.yolo_model.names
 
             for r in results:
@@ -306,7 +318,7 @@ class ExamDetector:
             return False
 
     def detect_movement(self, frame):
-        """Detect excessive movement with error handling"""
+        """Detect excessive movement"""
         try:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             if self.prev_gray is None:
@@ -314,130 +326,197 @@ class ExamDetector:
                 return False
             
             diff = cv2.absdiff(self.prev_gray, gray)
-            _, th = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+            _, th = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
             movement = np.sum(th)
             self.prev_gray = gray.copy()
             
             self.movement_window.append(movement)
-            if len(self.movement_window) > 10:
+            if len(self.movement_window) > 20:
                 self.movement_window.pop(0)
             
             return np.mean(self.movement_window) > self.movement_threshold
         except Exception:
             return False
 
+    def _accumulate_violation(self, vtype, flag):
+        """Accumulate violations with thresholds (like in working code)"""
+        if flag:
+            # Phone and paper are detected immediately
+            if vtype in ['phone', 'paper']:
+                with self.violations_lock:
+                    self.total_violations += 1
+                    t = datetime.now().strftime('%H:%M:%S')
+                    self.violations.append({'type': vtype, 'time': t})
+                    print(f'Violation: {vtype} at {t}')
+                return
+
+            # Other violations use accumulation
+            self._counters[vtype] += 1
+        else:
+            self._counters[vtype] = max(0, self._counters[vtype] - 2)
+
+        # Check threshold for accumulated violations
+        if self._counters[vtype] > self._thresholds[vtype]:
+            self._counters[vtype] = 0
+            with self.violations_lock:
+                self.total_violations += 1
+                t = datetime.now().strftime('%H:%M:%S')
+                self.violations.append({'type': vtype, 'time': t})
+                print(f'Violation: {vtype} at {t}')
+
     def process_frame(self, frame):
-        """Process frame and return annotated result with error handling"""
+        """Process frame and return annotated result (like working code architecture)"""
         try:
             self.frame_counter += 1
             annotated = frame.copy()
-            
-            # Skip processing on some frames for performance
-            current_time = time.time()
-            should_process = (current_time - self.last_process_time > 0.2)  # Process every 200ms
 
-            # Face detection (always do this)
-            face_result = self.detect_face_mesh(frame)
-            face_bbox = face_result[0] if face_result else None
-            looking_forward = face_result[2] if face_result else False
+            face_bbox = None
+            left_right = (None, None)
+            looking_forward = True
 
-            # Draw face rectangle
-            if face_bbox is not None:
-                x, y, w, h = face_bbox
-                cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            # Face tracking with CSRT (like working code)
+            if self.tracking and (self.frame_counter % self.detection_interval != 0):
+                try:
+                    ok, bbox = self.tracker.update(frame)
+                    if ok:
+                        x, y, w, h = map(int, bbox)
+                        face_bbox = (x, y, w, h)
+                        cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    else:
+                        self.tracking = False
+                        self.tracker = None
+                except Exception as e:
+                    print(f"Tracker error: {e}")
+                    self.tracking = False
+                    self.tracker = None
 
-            phone = paper = False
-            excessive_movement = False
-            
-            if should_process:
-                self.last_process_time = current_time
-                
-                # Object detection
-                if self.use_yolo:
-                    phone, paper = self.detect_objects_yolo(annotated)
-                else:
-                    phone, paper = self.detect_objects_heuristic(annotated)
-                
-                # Movement detection
-                excessive_movement = self.detect_movement(frame)
-                
-                # Check and record violations
-                timestamp = datetime.now().strftime('%H:%M:%S')
-                
-                with self.violations_lock:
-                    if face_bbox is None:
-                        self._add_violation('Face Absent', timestamp)
-                    elif not looking_forward:
-                        self._add_violation('Looking Away', timestamp)
-                    if phone:
-                        self._add_violation('Phone Detected', timestamp)
-                    if paper:
-                        self._add_violation('Paper Detected', timestamp)
-                    if excessive_movement:
-                        self._add_violation('Excessive Movement', timestamp)
+            # Face detection with MediaPipe
+            if not self.tracking or (self.frame_counter % self.detection_interval == 0):
+                res = self.detect_face_mesh(frame)
+                if res[0] is not None:
+                    face_bbox, left_right, looking_forward = res
+                    x, y, w, h = face_bbox
+                    
+                    # Initialize CSRT tracker
+                    try:
+                        self.tracker = cv2.TrackerCSRT_create()
+                        self.tracker.init(frame, tuple(face_bbox))
+                        self.tracking = True
+                        cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    except Exception as e:
+                        print(f"Tracker init error: {e}")
+                        cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+            # Object detection
+            if self.use_yolo:
+                phone, paper = self.detect_objects_yolo(annotated)
+            else:
+                phone, paper = self.detect_objects_heuristic(annotated)
+
+            # Movement detection
+            excessive_movement = self.detect_movement(frame)
+
+            # Violation processing (like working code)
+            if face_bbox is None:
+                self.face_lost_counter += 1
+                if self.face_lost_counter > self.face_lost_threshold:
+                    self._accumulate_violation('absent', 1)
+            else:
+                self.face_lost_counter = 0
+                self._accumulate_violation('absent', 0)
+
+            if face_bbox is not None and not looking_forward:
+                self._accumulate_violation('looking_away', 1)
+            else:
+                self._accumulate_violation('looking_away', 0)
+
+            if phone:
+                self._accumulate_violation('phone', 1)
+            else:
+                self._accumulate_violation('phone', 0)
+
+            if paper:
+                self._accumulate_violation('paper', 1)
+            else:
+                self._accumulate_violation('paper', 0)
+
+            if excessive_movement:
+                self._accumulate_violation('movement', 1)
+            else:
+                self._accumulate_violation('movement', 0)
 
             # Draw status overlay
-            self._draw_status(annotated, face_bbox is not None, looking_forward, phone, paper, excessive_movement)
+            self._draw_status(annotated, face_bbox is not None, left_right[0] is not None,
+                            looking_forward, phone, paper, excessive_movement)
             
             return annotated
             
         except Exception as e:
             print(f"Frame processing error: {e}")
-            # Return original frame with error message
             cv2.putText(frame, f"Processing Error: {str(e)[:50]}...", 
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             return frame
 
-    def _add_violation(self, vtype, time):
-        """Add violation if not duplicate"""
-        if not self.violations or self.violations[-1]['type'] != vtype:
-            self.total_violations += 1
-            self.violations.append({'type': vtype, 'time': time})
-
-    def _draw_status(self, frame, face, looking_forward, phone, paper, movement):
-        """Draw status overlay on frame"""
+    def _draw_status(self, frame, face, eyes, gaze, phone, paper, movement):
+        """Draw status overlay on frame (like working code)"""
         try:
             h, w = frame.shape[:2]
             
             # Semi-transparent overlay
             overlay = frame.copy()
-            cv2.rectangle(overlay, (10, 10), (400, 140), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.8, frame, 0.2, 0, frame)
+            cv2.rectangle(overlay, (10, 10), (420, 140), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
             
-            # Status text
-            y = 30
-            cv2.putText(frame, f'Violations: {self.total_violations}', 
+            y = 35
+            cv2.putText(frame, f'Total Violations: {self.total_violations}', 
                        (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            y += 25
+            y += 30
             
-            status_items = [
-                ('Face', face),
-                ('Gaze', looking_forward),
-                ('Phone', not phone),
-                ('Paper', not paper)
+            items = [
+                ('Face', face), 
+                ('Movement Normal', not movement),
+                ('Phone Clear', not phone),
+                ('Paper Clear', not paper)
             ]
             
-            for label, is_ok in status_items:
-                color = (0, 255, 0) if is_ok else (0, 0, 255)
-                status = 'OK' if is_ok else 'VIOLATION'
-                cv2.putText(frame, f'{label}: {status}', 
-                           (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                y += 22
+            for label, ok in items:
+                color = (0, 255, 0) if ok else (0, 0, 255)
+                txt = 'OK' if ok else 'VIOLATION'
+                cv2.putText(frame, f'{label}: {txt}', 
+                           (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                y += 24
         except Exception as e:
             print(f"Status drawing error: {e}")
 
+# THREAD-SAFE GLOBAL DETECTOR - This is the key!
+detector_lock = threading.Lock()
+global_detector = None
+
+def get_global_detector():
+    """Thread-safe getter for detector"""
+    with detector_lock:
+        return global_detector
+
+def set_global_detector(detector):
+    """Thread-safe setter for detector"""
+    with detector_lock:
+        global global_detector
+        global_detector = detector
+
 def video_frame_callback(frame):
-    """WebRTC video frame callback with session_state detector access"""
+    """WebRTC video frame callback with thread-safe detector access"""
     try:
         img = frame.to_ndarray(format="bgr24")
         
-        # Use session_state detector
-        if hasattr(st.session_state, 'detector') and st.session_state.detector is not None:
+        # Get detector in thread-safe way
+        detector = get_global_detector()
+        
+        if detector is not None:
             # Process the frame
-            processed_img = st.session_state.detector.process_frame(img)
+            processed_img = detector.process_frame(img)
             return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
         else:
-            # Return original frame with initialization message if detector not available
+            # Return original frame with initialization message
             cv2.putText(img, "Detector not initialized - Click Initialize button", 
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
             cv2.putText(img, "System ready for detection", 
@@ -446,7 +525,6 @@ def video_frame_callback(frame):
             
     except Exception as e:
         print(f"Frame callback error: {e}")
-        # Return original frame on error
         try:
             img = frame.to_ndarray(format="bgr24")
             cv2.putText(img, f"Callback Error: {str(e)[:30]}...", (10, 30), 
@@ -465,9 +543,7 @@ def main():
         st.info("Run: `pip install mediapipe streamlit-webrtc`")
         return
 
-    # Initialize session state
-    if 'detector' not in st.session_state:
-        st.session_state.detector = None
+    # Initialize session state for UI only
     if 'detector_initialized' not in st.session_state:
         st.session_state.detector_initialized = False
     if 'connection_state' not in st.session_state:
@@ -477,11 +553,6 @@ def main():
 
     # Sidebar configuration
     st.sidebar.header("🔧 Settings")
-    
-    # Connection troubleshooting
-    st.sidebar.subheader("🌐 Connection")
-    if st.sidebar.button("🔧 Test Connection"):
-        st.sidebar.info("Testing WebRTC connection... Check browser console for details.")
     
     use_yolo = st.sidebar.checkbox('🎯 Use YOLO Detection', 
                                   value=False,
@@ -497,26 +568,27 @@ def main():
         if st.button("🚀 Initialize"):
             with st.spinner("Initializing detector..."):
                 try:
-                    # Create detector and store in session_state
-                    st.session_state.detector = ExamDetector(use_yolo=use_yolo)
+                    # Create detector and set it globally (thread-safe)
+                    new_detector = ExamDetector(use_yolo=use_yolo)
+                    set_global_detector(new_detector)
                     st.session_state.detector_initialized = True
-                    st.session_state.init_message = "✅ Detector initialized successfully! You can now start the video stream."
+                    st.session_state.init_message = "✅ Detector initialized successfully!"
                     st.success("✅ Detector initialized!")
-                    # Force a rerun to update the UI
                     time.sleep(0.5)
                     st.rerun()
                 except Exception as e:
-                    st.session_state.detector = None
+                    set_global_detector(None)
                     st.session_state.detector_initialized = False
                     st.session_state.init_message = f"❌ Initialization failed: {e}"
                     st.error(f"❌ Initialization failed: {e}")
     
     with col_btn2:
         if st.button("🔄 Reset"):
-            if st.session_state.detector:
-                with st.session_state.detector.violations_lock:
-                    st.session_state.detector.violations = []
-                    st.session_state.detector.total_violations = 0
+            detector = get_global_detector()
+            if detector:
+                with detector.violations_lock:
+                    detector.violations = []
+                    detector.total_violations = 0
                 st.success("✅ Violations reset!")
             else:
                 st.warning("⚠️ No detector to reset. Initialize first.")
@@ -535,10 +607,9 @@ def main():
     with col1:
         st.markdown("### 📹 Real-Time Video Stream")
         
-        # Connection status indicator
         connection_placeholder = st.empty()
         
-        # WebRTC Streamer with enhanced error handling
+        # WebRTC Streamer
         webrtc_ctx = webrtc_streamer(
             key="exam-monitor",
             mode=WebRtcMode.SENDRECV,
@@ -560,7 +631,7 @@ def main():
                 )
             else:
                 connection_placeholder.markdown(
-                    '<div class="connection-status disconnected">🟡 Stream Active but Detector Not Initialized - Click Initialize button</div>', 
+                    '<div class="connection-status disconnected">🟡 Stream Active but Detector Not Initialized</div>', 
                     unsafe_allow_html=True
                 )
             st.session_state.connection_state = "connected"
@@ -570,48 +641,29 @@ def main():
                 unsafe_allow_html=True
             )
             st.session_state.connection_state = "disconnected"
-        
-        # Troubleshooting tips
-        if not webrtc_ctx.state.playing:
-            st.info("""
-            **🔧 Connection Issues?**
-            1. **First**, click the "🚀 Initialize" button in the sidebar
-            2. Allow camera permissions in your browser
-            3. Try refreshing the page
-            4. Check if other apps are using your camera
-            5. Try a different browser (Chrome/Firefox recommended)
-            6. Check your internet connection
-            """)
-        elif not st.session_state.detector_initialized:
-            st.warning("""
-            **⚠️ Stream is active but detector is not initialized!**
-            
-            Click the **"🚀 Initialize"** button in the sidebar to start the detection system.
-            """)
 
     with col2:
         st.markdown("### 🎛️ Control Panel")
-        
-        # Real-time violations display
         st.markdown("### 🚨 Live Violations")
         
         violations_placeholder = st.empty()
         
-        # Update violations display
-        if st.session_state.detector and st.session_state.detector_initialized:
+        # Update violations display using global detector
+        detector = get_global_detector()
+        if detector and st.session_state.detector_initialized:
             try:
-                with st.session_state.detector.violations_lock:
+                with detector.violations_lock:
                     # Metrics
                     col_m1, col_m2 = st.columns(2)
                     with col_m1:
-                        st.metric("Total", st.session_state.detector.total_violations)
+                        st.metric("Total", detector.total_violations)
                     with col_m2:
-                        st.metric("Frames", st.session_state.detector.frame_counter)
+                        st.metric("Frames", detector.frame_counter)
                     
                     # Recent violations
-                    if st.session_state.detector.violations:
+                    if detector.violations:
                         violation_text = '<div class="violation-box">'
-                        recent_violations = st.session_state.detector.violations[-8:]  # Last 8 violations
+                        recent_violations = detector.violations[-8:]  # Last 8 violations
                         
                         for i, v in enumerate(reversed(recent_violations), 1):
                             violation_text += f'<p><strong>#{len(recent_violations)-i+1}</strong> {v["type"]} at {v["time"]}</p>'
@@ -634,38 +686,8 @@ def main():
             st.metric("YOLO", "✅" if YOLO_AVAILABLE else "❌")
         with status_col3:
             st.metric("Detector", "✅" if st.session_state.detector_initialized else "❌")
-        
-        # Instructions
-        with st.expander("📋 Instructions", expanded=False):
-            st.markdown("""
-            **🚀 Getting Started:**
-            1. **FIRST**: Click **"🚀 Initialize"** to load the detector
-            2. **THEN**: Click **"START"** on the video stream
-            3. Allow camera permissions in your browser
-            4. Monitor real-time violations on the right
-            
-            **🎯 What We Monitor:**
-            - 👤 Face presence and tracking
-            - 👁️ Gaze direction (looking away)
-            - 📱 Phone/device detection
-            - 📄 Paper/book detection
-            - 🚶 Excessive movement
-            
-            **⚡ Real-Time Features:**
-            - Zero-latency WebRTC streaming
-            - Live violation alerts
-            - Continuous monitoring
-            - Browser-based (no downloads needed)
-            
-            **🔧 Troubleshooting:**
-            - **IMPORTANT**: Always click "🚀 Initialize" BEFORE starting the stream
-            - If connection fails, try refreshing the page
-            - Ensure camera permissions are granted
-            - Use Chrome or Firefox for best compatibility
-            - Close other applications using the camera
-            """)
 
-        # Auto-refresh for real-time updates (only when both stream and detector are active)
+        # Auto-refresh for real-time updates
         if (webrtc_ctx.state.playing and 
             st.session_state.connection_state == "connected" and 
             st.session_state.detector_initialized):
@@ -678,10 +700,3 @@ if __name__ == '__main__':
     except Exception as e:
         st.error(f"🚨 Application Error: {e}")
         st.info("💡 Make sure you have installed: pip install streamlit-webrtc mediapipe opencv-python")
-        st.code("""
-        # Install required packages:
-        pip install streamlit-webrtc mediapipe opencv-python numpy
-        
-        # Optional for better detection:
-        pip install ultralytics
-        """)
