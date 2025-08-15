@@ -16,15 +16,21 @@ logging.getLogger('aiortc').setLevel(logging.ERROR)
 try:
     import mediapipe as mp
     MP_AVAILABLE = True
-except Exception:
+    print(f"✅ MediaPipe imported successfully (version: {mp.__version__})")
+except Exception as e:
     MP_AVAILABLE = False
+    print(f"❌ MediaPipe import failed: {e}")
+    print("💡 Install MediaPipe: pip install mediapipe")
 
 # Optional: ultralytics YOLO
 try:
     from ultralytics import YOLO
     YOLO_AVAILABLE = True
-except Exception:
+    print("✅ Ultralytics YOLO imported successfully")
+except Exception as e:
     YOLO_AVAILABLE = False
+    print(f"❌ Ultralytics import failed: {e}")
+    print("💡 Install Ultralytics: pip install ultralytics")
 
 # Streamlit page config
 st.set_page_config(
@@ -125,14 +131,26 @@ class ExamDetector:
         if not MP_AVAILABLE:
             raise RuntimeError("MediaPipe is required. Install mediapipe package.")
 
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
+        # Initialize MediaPipe
+        self.mp_face_mesh = None
+        self.face_mesh = None
+        self.use_mediapipe = False
+        
+        try:
+            self.mp_face_mesh = mp.solutions.face_mesh
+            self.face_mesh = self.mp_face_mesh.FaceMesh(
+                static_image_mode=False,
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5
+            )
+            self.use_mediapipe = True
+            print("✅ MediaPipe FaceMesh initialized successfully")
+        except Exception as e:
+            print(f"❌ MediaPipe initialization failed: {e}")
+            print("⚠️ Using fallback face detection (OpenCV)")
+            self.use_mediapipe = False
 
         # Tracking
         self.tracker = None
@@ -153,12 +171,18 @@ class ExamDetector:
         self.yolo_model = None
         if use_yolo and YOLO_AVAILABLE:
             try:
+                print("🔄 Loading YOLO model...")
                 self.yolo_model = YOLO('yolov8n.pt')
                 self.use_yolo = True
-                print("YOLO model loaded successfully")
+                print("✅ YOLO model loaded successfully")
             except Exception as e:
-                print(f'YOLO load failed: {e}')
+                print(f'❌ YOLO load failed: {e}')
+                print("⚠️ Continuing without YOLO - using basic detection")
                 self.use_yolo = False
+        elif use_yolo and not YOLO_AVAILABLE:
+            print("⚠️ YOLO requested but not available - using basic detection")
+        else:
+            print("ℹ️ Using basic object detection (no YOLO)")
 
         # Frame processing
         self.frame_counter = 0
@@ -182,6 +206,13 @@ class ExamDetector:
         print("✅ ExamDetector initialized successfully")
 
     def detect_face_mesh(self, frame):
+        """Detect face using MediaPipe Face Mesh or OpenCV fallback"""
+        if self.use_mediapipe and self.face_mesh is not None:
+            return self._detect_face_mediapipe(frame)
+        else:
+            return self._detect_face_opencv(frame)
+    
+    def _detect_face_mediapipe(self, frame):
         """Detect face using MediaPipe Face Mesh"""
         try:
             img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -227,7 +258,41 @@ class ExamDetector:
             return bbox, (left_center, right_center), looking_forward
             
         except Exception as e:
-            print(f"Face detection error: {e}")
+            print(f"MediaPipe face detection error: {e}")
+            return None, None, False
+    
+    def _detect_face_opencv(self, frame):
+        """Fallback face detection using OpenCV"""
+        try:
+            # Load OpenCV face cascade
+            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # Detect faces
+            faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+            
+            if len(faces) > 0:
+                # Use the largest face
+                largest_face = max(faces, key=lambda x: x[2] * x[3])
+                x, y, w, h = largest_face
+                bbox = (x, y, w, h)
+                
+                # Simple gaze detection (assume looking forward if face is detected)
+                looking_forward = True
+                
+                # Estimate eye positions
+                eye_y = y + int(h * 0.4)
+                left_eye_x = x + int(w * 0.3)
+                right_eye_x = x + int(w * 0.7)
+                left_center = (left_eye_x, eye_y)
+                right_center = (right_eye_x, eye_y)
+                
+                return bbox, (left_center, right_center), looking_forward
+            else:
+                return None, None, False
+                
+        except Exception as e:
+            print(f"OpenCV face detection error: {e}")
             return None, None, False
 
     def detect_objects_yolo(self, frame):
@@ -464,13 +529,19 @@ class ExamDetector:
             
             # Semi-transparent overlay
             overlay = frame.copy()
-            cv2.rectangle(overlay, (10, 10), (420, 140), (0, 0, 0), -1)
+            cv2.rectangle(overlay, (10, 10), (420, 160), (0, 0, 0), -1)
             cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
             
             y = 35
             cv2.putText(frame, f'Total Violations: {self.total_violations}', 
                        (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             y += 30
+            
+            # Show detection method
+            method = "MediaPipe" if self.use_mediapipe else "OpenCV"
+            cv2.putText(frame, f'Detection: {method}', 
+                       (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            y += 24
             
             items = [
                 ('Face', face), 
@@ -502,6 +573,20 @@ def set_global_detector(detector):
     with detector_lock:
         global global_detector
         global_detector = detector
+        print(f"🔧 Global detector set: {detector is not None}")
+
+def debug_detector_status():
+    """Debug function to check detector status"""
+    detector = get_global_detector()
+    if detector:
+        print(f"✅ Detector exists: {type(detector)}")
+        print(f"   - MediaPipe: {detector.use_mediapipe}")
+        print(f"   - Face mesh: {detector.face_mesh is not None}")
+        print(f"   - YOLO: {detector.use_yolo}")
+        print(f"   - Frame counter: {detector.frame_counter}")
+        print(f"   - Detection method: {'MediaPipe' if detector.use_mediapipe else 'OpenCV'}")
+    else:
+        print("❌ No detector found")
 
 def video_frame_callback(frame):
     """WebRTC video frame callback with thread-safe detector access"""
@@ -512,9 +597,18 @@ def video_frame_callback(frame):
         detector = get_global_detector()
         
         if detector is not None:
-            # Process the frame
-            processed_img = detector.process_frame(img)
-            return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
+            try:
+                # Process the frame
+                processed_img = detector.process_frame(img)
+                return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
+            except Exception as e:
+                print(f"Frame processing error in callback: {e}")
+                # Return frame with error message
+                cv2.putText(img, f"Processing Error: {str(e)[:40]}...", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                cv2.putText(img, "Detector initialized but processing failed", 
+                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                return av.VideoFrame.from_ndarray(img, format="bgr24")
         else:
             # Return original frame with initialization message
             cv2.putText(img, "Detector not initialized - Click Initialize button", 
@@ -568,19 +662,27 @@ def main():
         if st.button("🚀 Initialize"):
             with st.spinner("Initializing detector..."):
                 try:
+                    # Clear any previous detector
+                    set_global_detector(None)
+                    st.session_state.detector_initialized = False
+                    
                     # Create detector and set it globally (thread-safe)
+                    print("🔄 Creating ExamDetector...")
                     new_detector = ExamDetector(use_yolo=use_yolo)
                     set_global_detector(new_detector)
                     st.session_state.detector_initialized = True
                     st.session_state.init_message = "✅ Detector initialized successfully!"
                     st.success("✅ Detector initialized!")
+                    print("✅ Global detector set successfully")
                     time.sleep(0.5)
                     st.rerun()
                 except Exception as e:
+                    print(f"❌ Initialization error: {e}")
                     set_global_detector(None)
                     st.session_state.detector_initialized = False
-                    st.session_state.init_message = f"❌ Initialization failed: {e}"
-                    st.error(f"❌ Initialization failed: {e}")
+                    st.session_state.init_message = f"❌ Initialization failed: {str(e)}"
+                    st.error(f"❌ Initialization failed: {str(e)}")
+                    st.info("💡 Try installing required packages: pip install mediapipe opencv-python")
     
     with col_btn2:
         if st.button("🔄 Reset"):
@@ -592,6 +694,19 @@ def main():
                 st.success("✅ Violations reset!")
             else:
                 st.warning("⚠️ No detector to reset. Initialize first.")
+    
+    # Debug button
+    if st.sidebar.button("🐛 Debug Status"):
+        debug_detector_status()
+        detector = get_global_detector()
+        if detector:
+            st.success("✅ Detector is initialized and working")
+            st.info(f"Frame counter: {detector.frame_counter}")
+            st.info(f"Detection method: {'MediaPipe' if detector.use_mediapipe else 'OpenCV'}")
+            st.info(f"YOLO enabled: {detector.use_yolo}")
+        else:
+            st.error("❌ Detector is not initialized")
+            st.info("Click '🚀 Initialize' to start the detector")
 
     # Show initialization status
     if st.session_state.init_message:
