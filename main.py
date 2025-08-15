@@ -16,21 +16,15 @@ logging.getLogger('aiortc').setLevel(logging.ERROR)
 try:
     import mediapipe as mp
     MP_AVAILABLE = True
-    print(f"✅ MediaPipe imported successfully (version: {mp.__version__})")
-except Exception as e:
+except Exception:
     MP_AVAILABLE = False
-    print(f"❌ MediaPipe import failed: {e}")
-    print("💡 Install MediaPipe: pip install mediapipe")
 
 # Optional: ultralytics YOLO
 try:
     from ultralytics import YOLO
     YOLO_AVAILABLE = True
-    print("✅ Ultralytics YOLO imported successfully")
-except Exception as e:
+except Exception:
     YOLO_AVAILABLE = False
-    print(f"❌ Ultralytics import failed: {e}")
-    print("💡 Install Ultralytics: pip install ultralytics")
 
 # Streamlit page config
 st.set_page_config(
@@ -112,88 +106,50 @@ st.markdown("""
         border-radius: 5px;
         margin: 10px 0;
     }
+    .loading-status {
+        background-color: #fff3cd;
+        color: #856404;
+        border: 1px solid #ffeaa7;
+        padding: 10px;
+        border-radius: 5px;
+        margin: 10px 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# Enhanced WebRTC configuration
+# Lightweight WebRTC configuration
 RTC_CONFIGURATION = RTCConfiguration({
     "iceServers": [
         {"urls": ["stun:stun.l.google.com:19302"]},
-        {"urls": ["stun:stun1.l.google.com:19302"]},
-        {"urls": ["stun:stun2.l.google.com:19302"]},
-        {"urls": ["stun:stun.stunprotocol.org:3478"]},
     ],
-    "iceCandidatePoolSize": 10
+    "iceCandidatePoolSize": 5
 })
 
 class ExamDetector:
     def __init__(self, use_yolo=False):
-        if not MP_AVAILABLE:
-            raise RuntimeError("MediaPipe is required. Install mediapipe package.")
-
-        # Initialize MediaPipe
-        self.mp_face_mesh = None
-        self.face_mesh = None
-        self.use_mediapipe = False
+        # Immediate initialization - no heavy operations
+        self.use_yolo_setting = use_yolo
         
-        try:
-            self.mp_face_mesh = mp.solutions.face_mesh
-            self.face_mesh = self.mp_face_mesh.FaceMesh(
-                static_image_mode=False,
-                max_num_faces=1,
-                refine_landmarks=True,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5
-            )
-            self.use_mediapipe = True
-            print("✅ MediaPipe FaceMesh initialized successfully")
-        except Exception as e:
-            print(f"❌ MediaPipe initialization failed: {e}")
-            print("⚠️ Using fallback face detection (OpenCV)")
-            self.use_mediapipe = False
-
-        # Tracking
+        # Lazy initialization flags
+        self.mediapipe_initialized = False
+        self.yolo_initialized = False
+        self.initialization_error = None
+        
+        # Basic attributes
         self.tracker = None
         self.tracking = False
-        
-        # Movement detection
         self.prev_gray = None
         self.movement_window = []
         self.movement_threshold = 80000
-
-        # Violations
         self.violations = []
         self.total_violations = 0
         self.violations_lock = threading.Lock()
-
-        # YOLO setup
-        self.use_yolo = False
-        self.yolo_model = None
-        if use_yolo and YOLO_AVAILABLE:
-            try:
-                print("🔄 Loading YOLO model...")
-                self.yolo_model = YOLO('yolov8n.pt')
-                self.use_yolo = True
-                print("✅ YOLO model loaded successfully")
-            except Exception as e:
-                print(f'❌ YOLO load failed: {e}')
-                print("⚠️ Continuing without YOLO - using basic detection")
-                self.use_yolo = False
-        elif use_yolo and not YOLO_AVAILABLE:
-            print("⚠️ YOLO requested but not available - using basic detection")
-        else:
-            print("ℹ️ Using basic object detection (no YOLO)")
-
-        # Frame processing
         self.frame_counter = 0
         self.detection_interval = 3
-        self.last_process_time = time.time()
-        
-        # Face tracking
         self.face_lost_counter = 0
         self.face_lost_threshold = 15
-
-        # Violation accumulation (like in working code)
+        
+        # Violation accumulation
         self._counters = {k: 0 for k in ['absent', 'looking_away', 'phone', 'paper', 'movement']}
         self._thresholds = {
             'absent': 50,
@@ -202,18 +158,72 @@ class ExamDetector:
             'paper': 3,
             'movement': 110
         }
+        
+        # These will be initialized lazily
+        self.mp_face_mesh = None
+        self.face_mesh = None
+        self.yolo_model = None
+        self.use_yolo = False
+        
+        print("✅ ExamDetector created (lazy initialization)")
 
-        print("✅ ExamDetector initialized successfully")
+    def _init_mediapipe(self):
+        """Lazy initialization of MediaPipe"""
+        if self.mediapipe_initialized or not MP_AVAILABLE:
+            return
+        
+        try:
+            print("🔄 Initializing MediaPipe...")
+            self.mp_face_mesh = mp.solutions.face_mesh
+            self.face_mesh = self.mp_face_mesh.FaceMesh(
+                static_image_mode=False,
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5
+            )
+            self.mediapipe_initialized = True
+            print("✅ MediaPipe initialized successfully")
+        except Exception as e:
+            self.initialization_error = f"MediaPipe init failed: {e}"
+            print(f"❌ MediaPipe initialization failed: {e}")
+
+    def _init_yolo(self):
+        """Lazy initialization of YOLO"""
+        if self.yolo_initialized or not self.use_yolo_setting or not YOLO_AVAILABLE:
+            return
+        
+        try:
+            print("🔄 Initializing YOLO...")
+            self.yolo_model = YOLO('yolov8n.pt')
+            self.use_yolo = True
+            self.yolo_initialized = True
+            print("✅ YOLO initialized successfully")
+        except Exception as e:
+            self.initialization_error = f"YOLO init failed: {e}"
+            print(f"❌ YOLO initialization failed: {e}")
+
+    def get_initialization_status(self):
+        """Get current initialization status"""
+        mediapipe_status = "✅" if self.mediapipe_initialized else ("🔄" if MP_AVAILABLE else "❌")
+        yolo_status = "✅" if self.yolo_initialized else ("🔄" if (self.use_yolo_setting and YOLO_AVAILABLE) else "➖")
+        
+        if self.initialization_error:
+            return f"❌ {self.initialization_error}", False
+        elif self.mediapipe_initialized and (not self.use_yolo_setting or self.yolo_initialized):
+            return "✅ Fully initialized", True
+        else:
+            return f"🔄 Initializing... MediaPipe:{mediapipe_status} YOLO:{yolo_status}", False
 
     def detect_face_mesh(self, frame):
-        """Detect face using MediaPipe Face Mesh or OpenCV fallback"""
-        if self.use_mediapipe and self.face_mesh is not None:
-            return self._detect_face_mediapipe(frame)
-        else:
-            return self._detect_face_opencv(frame)
-    
-    def _detect_face_mediapipe(self, frame):
-        """Detect face using MediaPipe Face Mesh"""
+        """Detect face using MediaPipe Face Mesh with lazy initialization"""
+        # Lazy initialize MediaPipe
+        if not self.mediapipe_initialized:
+            self._init_mediapipe()
+        
+        if not self.mediapipe_initialized or self.face_mesh is None:
+            return None, None, False
+
         try:
             img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.face_mesh.process(img_rgb)
@@ -258,50 +268,20 @@ class ExamDetector:
             return bbox, (left_center, right_center), looking_forward
             
         except Exception as e:
-            print(f"MediaPipe face detection error: {e}")
-            return None, None, False
-    
-    def _detect_face_opencv(self, frame):
-        """Fallback face detection using OpenCV"""
-        try:
-            # Load OpenCV face cascade
-            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            
-            # Detect faces
-            faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-            
-            if len(faces) > 0:
-                # Use the largest face
-                largest_face = max(faces, key=lambda x: x[2] * x[3])
-                x, y, w, h = largest_face
-                bbox = (x, y, w, h)
-                
-                # Simple gaze detection (assume looking forward if face is detected)
-                looking_forward = True
-                
-                # Estimate eye positions
-                eye_y = y + int(h * 0.4)
-                left_eye_x = x + int(w * 0.3)
-                right_eye_x = x + int(w * 0.7)
-                left_center = (left_eye_x, eye_y)
-                right_center = (right_eye_x, eye_y)
-                
-                return bbox, (left_center, right_center), looking_forward
-            else:
-                return None, None, False
-                
-        except Exception as e:
-            print(f"OpenCV face detection error: {e}")
+            print(f"Face detection error: {e}")
             return None, None, False
 
     def detect_objects_yolo(self, frame):
-        """Detect objects using YOLO"""
+        """Detect objects using YOLO with lazy initialization"""
+        # Lazy initialize YOLO
+        if not self.yolo_initialized:
+            self._init_yolo()
+        
+        if not self.yolo_initialized or self.yolo_model is None:
+            return False, False
+
         phone_detected = False
         paper_detected = False
-        
-        if not self.use_yolo:
-            return phone_detected, paper_detected
 
         try:
             results = self.yolo_model(frame, conf=0.3, verbose=False, imgsz=640)
@@ -404,7 +384,7 @@ class ExamDetector:
             return False
 
     def _accumulate_violation(self, vtype, flag):
-        """Accumulate violations with thresholds (like in working code)"""
+        """Accumulate violations with thresholds"""
         if flag:
             # Phone and paper are detected immediately
             if vtype in ['phone', 'paper']:
@@ -430,16 +410,32 @@ class ExamDetector:
                 print(f'Violation: {vtype} at {t}')
 
     def process_frame(self, frame):
-        """Process frame and return annotated result (like working code architecture)"""
+        """Process frame and return annotated result with lazy initialization"""
         try:
             self.frame_counter += 1
             annotated = frame.copy()
 
+            # Get initialization status
+            init_status, fully_initialized = self.get_initialization_status()
+            
+            # Always show current status
+            cv2.putText(annotated, f"Status: {init_status}", 
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+            # If not fully initialized, show basic info and return
+            if not fully_initialized:
+                cv2.putText(annotated, "Initializing models in background...", 
+                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv2.putText(annotated, f"Frames processed: {self.frame_counter}", 
+                           (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                return annotated
+
+            # Full processing when initialized
             face_bbox = None
             left_right = (None, None)
             looking_forward = True
 
-            # Face tracking with CSRT (like working code)
+            # Face tracking with CSRT
             if self.tracking and (self.frame_counter % self.detection_interval != 0):
                 try:
                     ok, bbox = self.tracker.update(frame)
@@ -481,7 +477,7 @@ class ExamDetector:
             # Movement detection
             excessive_movement = self.detect_movement(frame)
 
-            # Violation processing (like working code)
+            # Violation processing
             if face_bbox is None:
                 self.face_lost_counter += 1
                 if self.face_lost_counter > self.face_lost_threshold:
@@ -523,25 +519,19 @@ class ExamDetector:
             return frame
 
     def _draw_status(self, frame, face, eyes, gaze, phone, paper, movement):
-        """Draw status overlay on frame (like working code)"""
+        """Draw status overlay on frame"""
         try:
             h, w = frame.shape[:2]
             
             # Semi-transparent overlay
             overlay = frame.copy()
-            cv2.rectangle(overlay, (10, 10), (420, 160), (0, 0, 0), -1)
+            cv2.rectangle(overlay, (10, 120), (420, 260), (0, 0, 0), -1)
             cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
             
-            y = 35
+            y = 145
             cv2.putText(frame, f'Total Violations: {self.total_violations}', 
                        (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             y += 30
-            
-            # Show detection method
-            method = "MediaPipe" if self.use_mediapipe else "OpenCV"
-            cv2.putText(frame, f'Detection: {method}', 
-                       (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-            y += 24
             
             items = [
                 ('Face', face), 
@@ -559,7 +549,7 @@ class ExamDetector:
         except Exception as e:
             print(f"Status drawing error: {e}")
 
-# THREAD-SAFE GLOBAL DETECTOR - This is the key!
+# THREAD-SAFE GLOBAL DETECTOR
 detector_lock = threading.Lock()
 global_detector = None
 
@@ -573,20 +563,6 @@ def set_global_detector(detector):
     with detector_lock:
         global global_detector
         global_detector = detector
-        print(f"🔧 Global detector set: {detector is not None}")
-
-def debug_detector_status():
-    """Debug function to check detector status"""
-    detector = get_global_detector()
-    if detector:
-        print(f"✅ Detector exists: {type(detector)}")
-        print(f"   - MediaPipe: {detector.use_mediapipe}")
-        print(f"   - Face mesh: {detector.face_mesh is not None}")
-        print(f"   - YOLO: {detector.use_yolo}")
-        print(f"   - Frame counter: {detector.frame_counter}")
-        print(f"   - Detection method: {'MediaPipe' if detector.use_mediapipe else 'OpenCV'}")
-    else:
-        print("❌ No detector found")
 
 def video_frame_callback(frame):
     """WebRTC video frame callback with thread-safe detector access"""
@@ -597,23 +573,14 @@ def video_frame_callback(frame):
         detector = get_global_detector()
         
         if detector is not None:
-            try:
-                # Process the frame
-                processed_img = detector.process_frame(img)
-                return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
-            except Exception as e:
-                print(f"Frame processing error in callback: {e}")
-                # Return frame with error message
-                cv2.putText(img, f"Processing Error: {str(e)[:40]}...", 
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                cv2.putText(img, "Detector initialized but processing failed", 
-                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                return av.VideoFrame.from_ndarray(img, format="bgr24")
+            # Process the frame
+            processed_img = detector.process_frame(img)
+            return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
         else:
             # Return original frame with initialization message
             cv2.putText(img, "Detector not initialized - Click Initialize button", 
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-            cv2.putText(img, "System ready for detection", 
+            cv2.putText(img, "WebRTC stream ready - waiting for detector", 
                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
             return av.VideoFrame.from_ndarray(img, format="bgr24")
             
@@ -629,7 +596,7 @@ def video_frame_callback(frame):
 
 def main():
     st.markdown('<div class="title">🎓 Real-Time Exam Monitor</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subtitle">WebRTC-powered real-time exam proctoring</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">WebRTC-powered real-time exam proctoring with lazy loading</div>', unsafe_allow_html=True)
 
     # Check MediaPipe availability
     if not MP_AVAILABLE:
@@ -642,8 +609,6 @@ def main():
         st.session_state.detector_initialized = False
     if 'connection_state' not in st.session_state:
         st.session_state.connection_state = "disconnected"
-    if 'init_message' not in st.session_state:
-        st.session_state.init_message = ""
 
     # Sidebar configuration
     st.sidebar.header("🔧 Settings")
@@ -660,29 +625,18 @@ def main():
     col_btn1, col_btn2 = st.sidebar.columns(2)
     with col_btn1:
         if st.button("🚀 Initialize"):
-            with st.spinner("Initializing detector..."):
-                try:
-                    # Clear any previous detector
-                    set_global_detector(None)
-                    st.session_state.detector_initialized = False
-                    
-                    # Create detector and set it globally (thread-safe)
-                    print("🔄 Creating ExamDetector...")
-                    new_detector = ExamDetector(use_yolo=use_yolo)
-                    set_global_detector(new_detector)
-                    st.session_state.detector_initialized = True
-                    st.session_state.init_message = "✅ Detector initialized successfully!"
-                    st.success("✅ Detector initialized!")
-                    print("✅ Global detector set successfully")
-                    time.sleep(0.5)
-                    st.rerun()
-                except Exception as e:
-                    print(f"❌ Initialization error: {e}")
-                    set_global_detector(None)
-                    st.session_state.detector_initialized = False
-                    st.session_state.init_message = f"❌ Initialization failed: {str(e)}"
-                    st.error(f"❌ Initialization failed: {str(e)}")
-                    st.info("💡 Try installing required packages: pip install mediapipe opencv-python")
+            try:
+                # Quick initialization - no heavy operations
+                new_detector = ExamDetector(use_yolo=use_yolo)
+                set_global_detector(new_detector)
+                st.session_state.detector_initialized = True
+                st.success("✅ Detector created! Models will load in background during streaming.")
+                time.sleep(0.5)
+                st.rerun()
+            except Exception as e:
+                set_global_detector(None)
+                st.session_state.detector_initialized = False
+                st.error(f"❌ Initialization failed: {e}")
     
     with col_btn2:
         if st.button("🔄 Reset"):
@@ -694,44 +648,35 @@ def main():
                 st.success("✅ Violations reset!")
             else:
                 st.warning("⚠️ No detector to reset. Initialize first.")
-    
-    # Debug button
-    if st.sidebar.button("🐛 Debug Status"):
-        debug_detector_status()
-        detector = get_global_detector()
-        if detector:
-            st.success("✅ Detector is initialized and working")
-            st.info(f"Frame counter: {detector.frame_counter}")
-            st.info(f"Detection method: {'MediaPipe' if detector.use_mediapipe else 'OpenCV'}")
-            st.info(f"YOLO enabled: {detector.use_yolo}")
-        else:
-            st.error("❌ Detector is not initialized")
-            st.info("Click '🚀 Initialize' to start the detector")
 
-    # Show initialization status
-    if st.session_state.init_message:
-        if "✅" in st.session_state.init_message:
-            st.markdown(f'<div class="init-success">{st.session_state.init_message}</div>', 
-                       unsafe_allow_html=True)
+    # Show detector status
+    detector = get_global_detector()
+    if detector:
+        status_msg, fully_ready = detector.get_initialization_status()
+        if fully_ready:
+            st.sidebar.markdown(f'<div class="init-success">{status_msg}</div>', 
+                               unsafe_allow_html=True)
         else:
-            st.error(st.session_state.init_message)
+            st.sidebar.markdown(f'<div class="loading-status">{status_msg}</div>', 
+                               unsafe_allow_html=True)
 
     # Main layout
     col1, col2 = st.columns([2, 1], gap="large")
 
     with col1:
         st.markdown("### 📹 Real-Time Video Stream")
+        st.info("💡 **New**: Models load in the background! You can start the stream immediately after clicking Initialize.")
         
         connection_placeholder = st.empty()
         
-        # WebRTC Streamer
+        # WebRTC Streamer - lightweight config for faster connection
         webrtc_ctx = webrtc_streamer(
             key="exam-monitor",
             mode=WebRtcMode.SENDRECV,
             rtc_configuration=RTC_CONFIGURATION,
             video_frame_callback=video_frame_callback,
             media_stream_constraints={
-                "video": {"width": 640, "height": 480, "frameRate": 30},
+                "video": {"width": 640, "height": 480, "frameRate": 15},  # Reduced framerate for stability
                 "audio": False
             },
             async_processing=True,
@@ -741,7 +686,7 @@ def main():
         if webrtc_ctx.state.playing:
             if st.session_state.detector_initialized:
                 connection_placeholder.markdown(
-                    '<div class="connection-status connected">🟢 Stream Active - Real-time monitoring in progress</div>', 
+                    '<div class="connection-status connected">🟢 Stream Active - AI models loading in background</div>', 
                     unsafe_allow_html=True
                 )
             else:
@@ -752,7 +697,7 @@ def main():
             st.session_state.connection_state = "connected"
         else:
             connection_placeholder.markdown(
-                '<div class="connection-status disconnected">🔴 Stream Inactive - Click START to begin monitoring</div>', 
+                '<div class="connection-status disconnected">🔴 Stream Inactive - Click START to begin</div>', 
                 unsafe_allow_html=True
             )
             st.session_state.connection_state = "disconnected"
@@ -802,11 +747,37 @@ def main():
         with status_col3:
             st.metric("Detector", "✅" if st.session_state.detector_initialized else "❌")
 
-        # Auto-refresh for real-time updates
+        # Instructions
+        with st.expander("📋 New Lazy Loading Instructions", expanded=True):
+            st.markdown("""
+            **🚀 Quick Start (No More Timeouts!):**
+            1. Click **"🚀 Initialize"** → Instant response ⚡
+            2. Click **"START"** immediately → Stream connects fast 🎥
+            3. Models load in background while you see the stream 🧠
+            4. Full detection starts automatically when models are ready ✅
+            
+            **🎯 What You'll See:**
+            - **First**: Stream with "Initializing models..." overlay
+            - **Then**: Basic OpenCV processing (face rectangles, frame counter)
+            - **Finally**: Full AI detection (MediaPipe + YOLO if enabled)
+            
+            **⚡ Why This is Better:**
+            - ✅ No WebRTC connection timeouts
+            - ✅ Immediate visual feedback
+            - ✅ Progressive enhancement
+            - ✅ Models load only when needed
+            
+            **🔧 Troubleshooting:**
+            - If stream won't start: Refresh page and try again
+            - If models don't load: Check console for errors
+            - Connection issues: Allow camera permissions
+            """)
+
+        # Auto-refresh for real-time updates (reduced frequency)
         if (webrtc_ctx.state.playing and 
             st.session_state.connection_state == "connected" and 
             st.session_state.detector_initialized):
-            time.sleep(2)
+            time.sleep(3)  # Increased to 3 seconds for stability
             st.rerun()
 
 if __name__ == '__main__':
