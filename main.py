@@ -105,6 +105,14 @@ st.markdown("""
         color: #721c24;
         border: 1px solid #f5c6cb;
     }
+    .init-success {
+        background-color: #d1ecf1;
+        color: #0c5460;
+        border: 1px solid #bee5eb;
+        padding: 10px;
+        border-radius: 5px;
+        margin: 10px 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -119,23 +127,6 @@ RTC_CONFIGURATION = RTCConfiguration({
         # Additional public STUN servers
         {"urls": ["stun:stun.stunprotocol.org:3478"]},
         {"urls": ["stun:stun.voiparound.com"]},
-        
-        # TURN servers with fallback options
-        {
-            "urls": ["turn:openrelay.metered.ca:80"],
-            "username": "openrelayproject",
-            "credential": "openrelayproject",
-        },
-        {
-            "urls": ["turn:openrelay.metered.ca:443"],
-            "username": "openrelayproject", 
-            "credential": "openrelayproject",
-        },
-        {
-            "urls": ["turn:openrelay.metered.ca:443?transport=tcp"],
-            "username": "openrelayproject",
-            "credential": "openrelayproject",
-        }
     ],
     "iceCandidatePoolSize": 10
 })
@@ -176,6 +167,7 @@ class ExamDetector:
         self.frame_counter = 0
         self.detection_interval = 5  # Process every 5th frame for performance
         self.last_process_time = time.time()
+        self.initialized = True  # Mark as initialized
 
     def detect_face_mesh(self, frame):
         """Detect face using MediaPipe Face Mesh with error handling"""
@@ -434,31 +426,15 @@ class ExamDetector:
         except Exception as e:
             print(f"Status drawing error: {e}")
 
-# GLOBAL DETECTOR VARIABLE - This is the key fix!
-# Using a global variable instead of st.session_state in the callback
-GLOBAL_DETECTOR = None
-
-def get_detector():
-    """Thread-safe way to get the detector"""
-    global GLOBAL_DETECTOR
-    return GLOBAL_DETECTOR
-
-def set_detector(detector):
-    """Thread-safe way to set the detector"""
-    global GLOBAL_DETECTOR
-    GLOBAL_DETECTOR = detector
-
 def video_frame_callback(frame):
-    """WebRTC video frame callback with GLOBAL detector access"""
+    """WebRTC video frame callback with session_state detector access"""
     try:
         img = frame.to_ndarray(format="bgr24")
         
-        # Use global detector instead of st.session_state
-        detector = get_detector()
-        
-        if detector is not None:
+        # Use session_state detector
+        if hasattr(st.session_state, 'detector') and st.session_state.detector is not None:
             # Process the frame
-            processed_img = detector.process_frame(img)
+            processed_img = st.session_state.detector.process_frame(img)
             return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
         else:
             # Return original frame with initialization message if detector not available
@@ -489,11 +465,15 @@ def main():
         st.info("Run: `pip install mediapipe streamlit-webrtc`")
         return
 
-    # Initialize session state for UI management only
+    # Initialize session state
+    if 'detector' not in st.session_state:
+        st.session_state.detector = None
     if 'detector_initialized' not in st.session_state:
         st.session_state.detector_initialized = False
     if 'connection_state' not in st.session_state:
         st.session_state.connection_state = "disconnected"
+    if 'init_message' not in st.session_state:
+        st.session_state.init_message = ""
 
     # Sidebar configuration
     st.sidebar.header("🔧 Settings")
@@ -517,24 +497,37 @@ def main():
         if st.button("🚀 Initialize"):
             with st.spinner("Initializing detector..."):
                 try:
-                    # Create detector and set it globally
-                    new_detector = ExamDetector(use_yolo=use_yolo)
-                    set_detector(new_detector)
+                    # Create detector and store in session_state
+                    st.session_state.detector = ExamDetector(use_yolo=use_yolo)
                     st.session_state.detector_initialized = True
+                    st.session_state.init_message = "✅ Detector initialized successfully! You can now start the video stream."
                     st.success("✅ Detector initialized!")
+                    # Force a rerun to update the UI
+                    time.sleep(0.5)
+                    st.rerun()
                 except Exception as e:
-                    st.error(f"❌ Initialization failed: {e}")
+                    st.session_state.detector = None
                     st.session_state.detector_initialized = False
+                    st.session_state.init_message = f"❌ Initialization failed: {e}"
+                    st.error(f"❌ Initialization failed: {e}")
     
     with col_btn2:
         if st.button("🔄 Reset"):
-            detector = get_detector()
-            if detector:
-                detector.violations = []
-                detector.total_violations = 0
+            if st.session_state.detector:
+                with st.session_state.detector.violations_lock:
+                    st.session_state.detector.violations = []
+                    st.session_state.detector.total_violations = 0
                 st.success("✅ Violations reset!")
             else:
                 st.warning("⚠️ No detector to reset. Initialize first.")
+
+    # Show initialization status
+    if st.session_state.init_message:
+        if "✅" in st.session_state.init_message:
+            st.markdown(f'<div class="init-success">{st.session_state.init_message}</div>', 
+                       unsafe_allow_html=True)
+        else:
+            st.error(st.session_state.init_message)
 
     # Main layout
     col1, col2 = st.columns([2, 1], gap="large")
@@ -560,10 +553,16 @@ def main():
         
         # Update connection status
         if webrtc_ctx.state.playing:
-            connection_placeholder.markdown(
-                '<div class="connection-status connected">🟢 Stream Active - Real-time monitoring in progress</div>', 
-                unsafe_allow_html=True
-            )
+            if st.session_state.detector_initialized:
+                connection_placeholder.markdown(
+                    '<div class="connection-status connected">🟢 Stream Active - Real-time monitoring in progress</div>', 
+                    unsafe_allow_html=True
+                )
+            else:
+                connection_placeholder.markdown(
+                    '<div class="connection-status disconnected">🟡 Stream Active but Detector Not Initialized - Click Initialize button</div>', 
+                    unsafe_allow_html=True
+                )
             st.session_state.connection_state = "connected"
         else:
             connection_placeholder.markdown(
@@ -576,11 +575,18 @@ def main():
         if not webrtc_ctx.state.playing:
             st.info("""
             **🔧 Connection Issues?**
-            1. Allow camera permissions in your browser
-            2. Try refreshing the page
-            3. Check if other apps are using your camera
-            4. Try a different browser (Chrome/Firefox recommended)
-            5. Check your internet connection
+            1. **First**, click the "🚀 Initialize" button in the sidebar
+            2. Allow camera permissions in your browser
+            3. Try refreshing the page
+            4. Check if other apps are using your camera
+            5. Try a different browser (Chrome/Firefox recommended)
+            6. Check your internet connection
+            """)
+        elif not st.session_state.detector_initialized:
+            st.warning("""
+            **⚠️ Stream is active but detector is not initialized!**
+            
+            Click the **"🚀 Initialize"** button in the sidebar to start the detection system.
             """)
 
     with col2:
@@ -591,22 +597,21 @@ def main():
         
         violations_placeholder = st.empty()
         
-        # Update violations display using global detector
-        detector = get_detector()
-        if detector and st.session_state.detector_initialized:
+        # Update violations display
+        if st.session_state.detector and st.session_state.detector_initialized:
             try:
-                with detector.violations_lock:
+                with st.session_state.detector.violations_lock:
                     # Metrics
                     col_m1, col_m2 = st.columns(2)
                     with col_m1:
-                        st.metric("Total", detector.total_violations)
+                        st.metric("Total", st.session_state.detector.total_violations)
                     with col_m2:
-                        st.metric("Frames", detector.frame_counter)
+                        st.metric("Frames", st.session_state.detector.frame_counter)
                     
                     # Recent violations
-                    if detector.violations:
+                    if st.session_state.detector.violations:
                         violation_text = '<div class="violation-box">'
-                        recent_violations = detector.violations[-8:]  # Last 8 violations
+                        recent_violations = st.session_state.detector.violations[-8:]  # Last 8 violations
                         
                         for i, v in enumerate(reversed(recent_violations), 1):
                             violation_text += f'<p><strong>#{len(recent_violations)-i+1}</strong> {v["type"]} at {v["time"]}</p>'
@@ -618,7 +623,7 @@ def main():
             except Exception as e:
                 violations_placeholder.markdown(f'<div class="violation-box">Error reading violations: {e}</div>', unsafe_allow_html=True)
         else:
-            violations_placeholder.markdown('<div class="violation-box">Detector not initialized. Click "Initialize" to start.</div>', unsafe_allow_html=True)
+            violations_placeholder.markdown('<div class="violation-box">Detector not initialized. Click "🚀 Initialize" to start.</div>', unsafe_allow_html=True)
         
         # System status
         st.markdown("### ⚙️ System Status")
@@ -634,8 +639,8 @@ def main():
         with st.expander("📋 Instructions", expanded=False):
             st.markdown("""
             **🚀 Getting Started:**
-            1. Click **"Initialize"** to load the detector
-            2. Click **"START"** on the video stream
+            1. **FIRST**: Click **"🚀 Initialize"** to load the detector
+            2. **THEN**: Click **"START"** on the video stream
             3. Allow camera permissions in your browser
             4. Monitor real-time violations on the right
             
@@ -653,16 +658,18 @@ def main():
             - Browser-based (no downloads needed)
             
             **🔧 Troubleshooting:**
+            - **IMPORTANT**: Always click "🚀 Initialize" BEFORE starting the stream
             - If connection fails, try refreshing the page
             - Ensure camera permissions are granted
             - Use Chrome or Firefox for best compatibility
             - Close other applications using the camera
-            - **Important**: Always click "Initialize" before starting the stream
             """)
 
-        # Auto-refresh for real-time updates (reduced frequency to prevent errors)
-        if webrtc_ctx.state.playing and st.session_state.connection_state == "connected":
-            time.sleep(2)  # Increased interval to reduce load
+        # Auto-refresh for real-time updates (only when both stream and detector are active)
+        if (webrtc_ctx.state.playing and 
+            st.session_state.connection_state == "connected" and 
+            st.session_state.detector_initialized):
+            time.sleep(2)
             st.rerun()
 
 if __name__ == '__main__':
